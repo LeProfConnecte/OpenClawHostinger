@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
@@ -117,6 +117,12 @@ class SessionRequest(BaseModel):
 EMERGENT_AUTH_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
 SESSION_EXPIRY_DAYS = 7
 
+# Cookie security configuration (configurable for dev/prod)
+# In production behind CloudPanel/Nginx with HTTPS: COOKIE_SECURE=true, COOKIE_SAMESITE=lax
+# In local dev without HTTPS: COOKIE_SECURE=false, COOKIE_SAMESITE=lax
+COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').lower() == 'true'
+COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'lax')
+
 
 async def get_instance_owner() -> Optional[dict]:
     """Get the instance owner from database. Returns None if not locked yet."""
@@ -216,6 +222,40 @@ async def require_auth(request: Request) -> User:
     return user
 
 
+async def get_ws_user(websocket: WebSocket) -> Optional[User]:
+    """
+    Authenticate a WebSocket connection from cookies BEFORE accept().
+    Used to gate WebSocket access to authenticated owners only.
+    """
+    session_token = websocket.cookies.get("session_token")
+    if not session_token:
+        return None
+
+    session_doc = await db.user_sessions.find_one(
+        {"session_token": session_token},
+        {"_id": 0}
+    )
+    if not session_doc:
+        return None
+
+    expires_at = session_doc.get("expires_at")
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        return None
+
+    user_doc = await db.users.find_one(
+        {"user_id": session_doc["user_id"]},
+        {"_id": 0}
+    )
+    if not user_doc:
+        return None
+
+    return User(**user_doc)
+
+
 # ============== Auth Endpoints ==============
 
 @api_router.get("/auth/instance")
@@ -304,8 +344,8 @@ async def create_session(request: SessionRequest, response: Response):
             key="session_token",
             value=session_token,
             httponly=True,
-            secure=True,
-            samesite="none",
+            secure=COOKIE_SECURE,
+            samesite=COOKIE_SAMESITE,
             path="/",
             max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60
         )
@@ -345,8 +385,8 @@ async def logout(request: Request, response: Response):
     response.delete_cookie(
         key="session_token",
         path="/",
-        secure=True,
-        samesite="none"
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE
     )
 
     return {"ok": True, "message": "Logged out"}
@@ -685,6 +725,9 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
     with open(CONFIG_FILE, "w") as f:
         json.dump(existing_config, f, indent=2)
 
+    # Set secure permissions - config contains API keys and tokens
+    os.chmod(CONFIG_FILE, 0o600)
+
     logger.info(f"Updated Moltbot config at {CONFIG_FILE} for provider: {provider}")
     return final_token  # Return the token being used
 
@@ -695,20 +738,21 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
 
     # Check if already running via supervisor
     if SupervisorClient.status():
-        logger.info("Gateway already running via supervisor, recovering state...")
+        logger.info("Gateway already running via supervisor, applying new config and restarting...")
 
-        # Recover token from config
-        token = None
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-            token = config.get("gateway", {}).get("auth", {}).get("token")
-        except:
-            pass
+        # Always apply the new configuration and restart
+        token = create_moltbot_config(api_key=api_key, provider=provider, force_new_token=True, model=model)
 
-        if not token:
-            token = generate_token()
-            create_moltbot_config(token=token, api_key=api_key, provider=provider, force_new_token=True, model=model)
+        # Write environment file for supervisor wrapper to load
+        write_gateway_env(token=token, api_key=api_key, provider=provider)
+
+        # Restart the gateway to pick up the new config
+        if not SupervisorClient.restart():
+            logger.warning("Failed to restart gateway via supervisor, trying stop+start...")
+            SupervisorClient.stop()
+            await asyncio.sleep(2)
+            if not SupervisorClient.start():
+                raise HTTPException(status_code=500, detail="Failed to restart gateway with new configuration")
 
         gateway_state["token"] = token
         gateway_state["provider"] = provider
@@ -852,28 +896,39 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
 
 @api_router.get("/openclaw/status", response_model=OpenClawStatusResponse)
 async def get_moltbot_status(request: Request):
-    """Get the current status of the Moltbot gateway"""
+    """Get the current status of the Moltbot gateway.
+    Sensitive metadata (owner_user_id, provider, pid) is only exposed to the authenticated owner.
+    """
     user = await get_current_user(request)
     running = check_gateway_running()
 
     if running:
-        is_owner = user and gateway_state["owner_user_id"] == user.user_id
-        return OpenClawStatusResponse(
-            running=True,
-            pid=SupervisorClient.get_pid(),
-            provider=gateway_state["provider"],
-            started_at=gateway_state["started_at"],
-            controlUrl="/api/openclaw/ui/",
-            owner_user_id=gateway_state["owner_user_id"],
-            is_owner=is_owner
-        )
+        is_owner = bool(user and gateway_state["owner_user_id"] == user.user_id)
+        if is_owner:
+            # Owner gets full details
+            return OpenClawStatusResponse(
+                running=True,
+                pid=SupervisorClient.get_pid(),
+                provider=gateway_state["provider"],
+                started_at=gateway_state["started_at"],
+                controlUrl="/api/openclaw/ui/",
+                owner_user_id=gateway_state["owner_user_id"],
+                is_owner=True
+            )
+        else:
+            # Non-owner or unauthenticated: only reveal running status
+            return OpenClawStatusResponse(
+                running=True,
+                is_owner=False if user else None
+            )
     else:
         return OpenClawStatusResponse(running=False)
 
 
 @api_router.get("/openclaw/whatsapp/status")
-async def get_whatsapp_connection_status():
-    """Get basic WhatsApp connection status. Auto-fix handled by background watcher."""
+async def get_whatsapp_connection_status(request: Request):
+    """Get basic WhatsApp connection status. Requires authentication."""
+    await require_auth(request)
     return get_whatsapp_status()
 
 
@@ -1067,18 +1122,26 @@ async def proxy_moltbot_ui_root(request: Request):
     )
 
 
-# WebSocket proxy for Moltbot (Protected)
+# WebSocket proxy for Moltbot (Protected - requires auth + owner)
 @api_router.websocket("/openclaw/ws")
 async def websocket_proxy(websocket: WebSocket):
-    """WebSocket proxy for Moltbot Control UI"""
-    await websocket.accept()
+    """WebSocket proxy for Moltbot Control UI (authenticated, owner-only)"""
+    # Authenticate BEFORE accepting the WebSocket connection
+    user = await get_ws_user(websocket)
+    if not user:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+
+    # Verify the user is the instance owner
+    if gateway_state.get("owner_user_id") != user.user_id:
+        await websocket.close(code=4003, reason="Access denied: not the instance owner")
+        return
 
     if not check_gateway_running():
         await websocket.close(code=1013, reason="OpenClaw not running")
         return
 
-    # Note: WebSocket auth is handled by the token in the connection itself
-    # The Control UI passes the token in the connect message
+    await websocket.accept()
 
     # Get the token from state
     token = gateway_state.get("token")
@@ -1183,10 +1246,54 @@ async def get_status_checks():
 # Include the router in the main app
 app.include_router(api_router)
 
+# CSRF protection middleware - validates Origin header on state-changing requests
+# Combined with SameSite=Lax cookies, this provides robust CSRF protection
+@app.middleware("http")
+async def csrf_protection(request: Request, call_next):
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        origin = request.headers.get("origin")
+        if origin:
+            # Build expected same-origin from request headers
+            host = request.headers.get("host", "")
+            forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+            expected_origin = f"{forwarded_proto}://{host}"
+
+            # Collect allowed origins: same-origin + configured CORS origins
+            allowed = {expected_origin}
+            cors_env = os.environ.get('CORS_ORIGINS', '')
+            if cors_env and cors_env.strip() != '*':
+                for o in cors_env.split(','):
+                    o = o.strip()
+                    if o:
+                        allowed.add(o)
+
+            if origin not in allowed:
+                logger.warning(f"CSRF: blocked request from origin={origin}, allowed={allowed}")
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "CSRF validation failed: origin not allowed"}
+                )
+    return await call_next(request)
+
+
+# CORS configuration - CORS_ORIGINS must be set explicitly in production
+# Example: CORS_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+_cors_origins_raw = os.environ.get('CORS_ORIGINS', '')
+if _cors_origins_raw and _cors_origins_raw.strip() != '*':
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(',') if o.strip()]
+else:
+    if _cors_origins_raw.strip() == '*':
+        logger.warning(
+            "CORS_ORIGINS='*' is insecure with allow_credentials=True. "
+            "Set explicit origins (e.g. CORS_ORIGINS=https://yourdomain.com) for production."
+        )
+    # Default: empty list = same-origin only (no cross-origin allowed)
+    _cors_origins = []
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
