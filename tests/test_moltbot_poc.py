@@ -17,7 +17,7 @@ import signal
 import sys
 
 # Configuration
-MOLTBOT_PORT = 18789
+MOLTBOT_PORT = int(os.environ.get("GATEWAY_PORT", 18789))
 CONFIG_DIR = os.path.expanduser("~/.clawdbot")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "moltbot.json")
 WORKSPACE_DIR = os.path.expanduser("~/clawd")

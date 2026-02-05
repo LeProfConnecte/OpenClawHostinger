@@ -40,8 +40,8 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 # Moltbot Gateway Management
-MOLTBOT_PORT = 18789
-MOLTBOT_CONTROL_PORT = 18791
+MOLTBOT_PORT = int(os.environ.get("GATEWAY_PORT", 18789))
+MOLTBOT_CONTROL_PORT = int(os.environ.get("GATEWAY_CONTROL_PORT", 18791))
 CONFIG_DIR = os.environ.get("CLAWDBOT_HOME") or os.path.expanduser("~/.clawdbot")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "clawdbot.json")
 WORKSPACE_DIR = os.environ.get("OPENCLAW_WORKSPACE") or os.path.expanduser("~/clawd")
@@ -1065,17 +1065,17 @@ window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:
         let finalUrl = url;
 
         // Rewrite any OpenClaw gateway URLs to use our proxy
-        if (url.includes('127.0.0.1:18789') ||
-            url.includes('localhost:18789') ||
-            url.includes('0.0.0.0:18789') ||
-            (url.includes(':18789') && !url.includes('/api/openclaw/'))) {{
+        if (url.includes('127.0.0.1:{MOLTBOT_PORT}') ||
+            url.includes('localhost:{MOLTBOT_PORT}') ||
+            url.includes('0.0.0.0:{MOLTBOT_PORT}') ||
+            (url.includes(':{MOLTBOT_PORT}') && !url.includes('/api/openclaw/'))) {{
             finalUrl = proxyWsUrl;
         }}
 
         // If it's a relative URL or same-origin, redirect to proxy
         try {{
             const urlObj = new URL(url, window.location.origin);
-            if (urlObj.port === '18789' || urlObj.pathname === '/' && !url.startsWith(proxyWsUrl)) {{
+            if (urlObj.port === '{MOLTBOT_PORT}' || urlObj.pathname === '/' && !url.startsWith(proxyWsUrl)) {{
                 finalUrl = proxyWsUrl;
             }}
         }} catch (e) {{}}
