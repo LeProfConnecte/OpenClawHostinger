@@ -5,6 +5,7 @@ This module provides a clean interface for starting, stopping, and
 checking the status of the gateway process managed by supervisord.
 """
 
+import os
 import subprocess
 import logging
 
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 class SupervisorClient:
     """Client for interacting with supervisord to manage the gateway process."""
 
-    PROGRAM = "clawdbot-gateway"
+    PROGRAM = os.environ.get("SUPERVISOR_GATEWAY_PROGRAM", "clawdbot-gateway")
 
     @classmethod
     def start(cls) -> bool:

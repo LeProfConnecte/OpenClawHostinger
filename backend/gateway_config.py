@@ -10,8 +10,9 @@ import stat
 from pathlib import Path
 
 # Path to the gateway environment file
-GATEWAY_ENV_FILE = "/root/.clawdbot/gateway.env"
-GATEWAY_ENV_DIR = "/root/.clawdbot"
+# Use CLAWDBOT_HOME env var if set, otherwise fall back to ~/.clawdbot
+GATEWAY_ENV_DIR = os.environ.get("CLAWDBOT_HOME") or os.path.expanduser("~/.clawdbot")
+GATEWAY_ENV_FILE = os.path.join(GATEWAY_ENV_DIR, "gateway.env")
 
 
 def write_gateway_env(token: str, api_key: str = None, provider: str = "emergent") -> None:
