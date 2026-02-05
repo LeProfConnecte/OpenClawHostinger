@@ -15,7 +15,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import List, Literal, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -77,9 +77,9 @@ class StatusCheckCreate(BaseModel):
 
 
 class OpenClawStartRequest(BaseModel):
-    provider: str = "emergent"  # "emergent", "anthropic", "openai", or "openrouter"
+    provider: Literal["emergent", "anthropic", "openai", "openrouter"] = "emergent"
     apiKey: Optional[str] = None
-    model: Optional[str] = None  # Optional model override (mainly for openrouter)  # Optional - uses Emergent key if not provided
+    model: Optional[str] = None  # Optional model override (mainly for openrouter)
 
 
 class OpenClawStartResponse(BaseModel):
@@ -214,10 +214,9 @@ async def require_auth(request: Request) -> User:
     
     # Check if user is allowed to access this instance
     if not await check_instance_access(user):
-        owner = await get_instance_owner()
         raise HTTPException(
-            status_code=403, 
-            detail=f"This instance is locked to {owner.get('email', 'another user')}. Access denied."
+            status_code=403,
+            detail="This instance is locked to another user. Access denied."
         )
     return user
 
@@ -279,8 +278,8 @@ async def create_session(request: SessionRequest, response: Response):
     """
     try:
         # Call Emergent Auth to get user data
-        async with httpx.AsyncClient() as client:
-            auth_response = await client.get(
+        async with httpx.AsyncClient() as http_client:
+            auth_response = await http_client.get(
                 EMERGENT_AUTH_URL,
                 headers={"X-Session-ID": request.session_id},
                 timeout=10.0
@@ -298,17 +297,23 @@ async def create_session(request: SessionRequest, response: Response):
         if not email:
             raise HTTPException(status_code=400, detail="No email in auth response")
 
-        # Check if instance is locked to another user
-        owner = await get_instance_owner()
-        if owner and owner.get("email") != email:
-            logger.warning(f"Blocked login attempt from {email} - instance locked to {owner.get('email')}")
-            raise HTTPException(
-                status_code=403,
-                detail=f"This instance is private and locked to {owner.get('email')}. Access denied."
-            )
-
-        # Check if user exists
+        # Check if user exists first (needed for consistent instance lock check)
         existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+
+        # Check if instance is locked to another user (by user_id if known, email as fallback)
+        owner = await get_instance_owner()
+        if owner:
+            is_owner = False
+            if existing_user:
+                is_owner = owner.get("user_id") == existing_user["user_id"]
+            else:
+                is_owner = owner.get("email") == email
+            if not is_owner:
+                logger.warning(f"Blocked login attempt from {email} - instance locked to {owner.get('email')}")
+                raise HTTPException(
+                    status_code=403,
+                    detail="This instance is private and locked to the owner. Access denied."
+                )
 
         if existing_user:
             user_id = existing_user["user_id"]
@@ -362,7 +367,7 @@ async def create_session(request: SessionRequest, response: Response):
         raise
     except Exception as e:
         logger.error(f"Session creation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error during authentication")
 
 
 @api_router.get("/auth/me")
@@ -479,7 +484,7 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         try:
             with open(CONFIG_FILE, "r") as f:
                 existing_config = json.load(f)
-        except:
+        except (OSError, json.JSONDecodeError, ValueError):
             pass
 
     # Reuse existing token if available (to avoid triggering gateway restart)
@@ -487,7 +492,7 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
     if not force_new_token:
         try:
             existing_token = existing_config.get("gateway", {}).get("auth", {}).get("token")
-        except:
+        except (AttributeError, TypeError):
             pass
 
     # Use existing token, provided token, or generate new
@@ -807,10 +812,11 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
 
     # Wait for gateway to be ready
     max_wait = 60
-    start_time = asyncio.get_event_loop().time()
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
 
     async with httpx.AsyncClient() as http_client:
-        while asyncio.get_event_loop().time() - start_time < max_wait:
+        while loop.time() - start_time < max_wait:
             try:
                 response = await http_client.get(f"http://127.0.0.1:{MOLTBOT_PORT}/", timeout=2.0)
                 if response.status_code == 200:
@@ -892,7 +898,7 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
         raise
     except Exception as e:
         logger.error(f"Failed to start Moltbot: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to start OpenClaw. Check server logs for details.")
 
 
 @api_router.get("/openclaw/status", response_model=OpenClawStatusResponse)
@@ -1015,16 +1021,18 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
     if request.query_params:
         target_url += f"?{request.query_params}"
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as http_client:
         try:
-            # Forward the request
+            # Forward the request, stripping sensitive headers
             headers = dict(request.headers)
             headers.pop("host", None)
             headers.pop("content-length", None)
+            headers.pop("cookie", None)
+            headers.pop("authorization", None)
 
             body = await request.body()
 
-            response = await client.request(
+            response = await http_client.request(
                 method=request.method,
                 url=target_url,
                 headers=headers,
@@ -1043,46 +1051,42 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
             content = response.content
             content_type = response.headers.get("content-type", "")
 
-            # Get the current gateway token
-            current_token = gateway_state.get("token", "")
-
             # If it's HTML, rewrite any WebSocket URLs to use our proxy
             if "text/html" in content_type:
                 content_str = content.decode('utf-8', errors='ignore')
-                # Inject WebSocket URL override script with token
-                ws_override = f'''
+                # Inject WebSocket URL override script (auth via cookies, no token in page source)
+                ws_override = '''
 <script>
 // OpenClaw Proxy Configuration
-window.__MOLTBOT_PROXY_TOKEN__ = "{current_token}";
 window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host + '/api/openclaw/ws';
 
 // Override WebSocket to use proxy path
-(function() {{
+(function() {
     const originalWS = window.WebSocket;
     const proxyWsUrl = window.__MOLTBOT_PROXY_WS_URL__;
 
-    window.WebSocket = function(url, protocols) {{
+    window.WebSocket = function(url, protocols) {
         let finalUrl = url;
 
         // Rewrite any OpenClaw gateway URLs to use our proxy
         if (url.includes('127.0.0.1:18789') ||
             url.includes('localhost:18789') ||
             url.includes('0.0.0.0:18789') ||
-            (url.includes(':18789') && !url.includes('/api/openclaw/'))) {{
+            (url.includes(':18789') && !url.includes('/api/openclaw/'))) {
             finalUrl = proxyWsUrl;
-        }}
+        }
 
         // If it's a relative URL or same-origin, redirect to proxy
-        try {{
+        try {
             const urlObj = new URL(url, window.location.origin);
-            if (urlObj.port === '18789' || urlObj.pathname === '/' && !url.startsWith(proxyWsUrl)) {{
+            if (urlObj.port === '18789' || urlObj.pathname === '/' && !url.startsWith(proxyWsUrl)) {
                 finalUrl = proxyWsUrl;
-            }}
-        }} catch (e) {{}}
+            }
+        } catch (e) {}
 
         console.log('[OpenClaw Proxy] WebSocket:', url, '->', finalUrl);
         return new originalWS(finalUrl, protocols);
-    }};
+    };
 
     // Copy static properties
     window.WebSocket.prototype = originalWS.prototype;
@@ -1090,7 +1094,7 @@ window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:
     window.WebSocket.OPEN = originalWS.OPEN;
     window.WebSocket.CLOSING = originalWS.CLOSING;
     window.WebSocket.CLOSED = originalWS.CLOSED;
-}})();
+})();
 </script>
 '''
                 # Insert before </head> or at start of <body>
@@ -1215,7 +1219,7 @@ async def websocket_proxy(websocket: WebSocket):
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.close(code=1011, reason="Proxy connection ended")
-        except:
+        except Exception:
             pass
 
 
@@ -1279,21 +1283,25 @@ async def csrf_protection(request: Request, call_next):
 
 # CORS configuration - CORS_ORIGINS must be set explicitly in production
 # Example: CORS_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
-_cors_origins_raw = os.environ.get('CORS_ORIGINS', '')
-if _cors_origins_raw and _cors_origins_raw.strip() != '*':
+_cors_origins_raw = os.environ.get('CORS_ORIGINS', '').strip()
+_cors_allow_credentials = True
+
+if _cors_origins_raw == '*':
+    logger.error(
+        "CORS_ORIGINS='*' is not allowed with credentials. "
+        "Set explicit origins (e.g. CORS_ORIGINS=https://yourdomain.com). "
+        "Falling back to same-origin only."
+    )
+    _cors_origins = []
+elif _cors_origins_raw:
     _cors_origins = [o.strip() for o in _cors_origins_raw.split(',') if o.strip()]
 else:
-    if _cors_origins_raw.strip() == '*':
-        logger.warning(
-            "CORS_ORIGINS='*' is insecure with allow_credentials=True. "
-            "Set explicit origins (e.g. CORS_ORIGINS=https://yourdomain.com) for production."
-        )
     # Default: empty list = same-origin only (no cross-origin allowed)
     _cors_origins = []
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
+    allow_credentials=_cors_allow_credentials,
     allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1310,15 +1318,16 @@ async def whatsapp_auto_fix_watcher():
         await asyncio.sleep(5)
         try:
             status = get_whatsapp_status()
-            logger.info(f"[whatsapp-watcher] Check: linked={status['linked']}, registered={status['registered']}, phone={status['phone']}")
             if status["linked"] and not status["registered"]:
                 logger.info("[whatsapp-watcher] DETECTED registered=false, applying fix...")
                 if fix_registered_flag():
                     logger.info("[whatsapp-watcher] Fix applied, restarting gateway via supervisor...")
-                    result = subprocess.run(["supervisorctl", "restart", SupervisorClient.PROGRAM], capture_output=True, text=True)
-                    logger.info(f"[whatsapp-watcher] Supervisor restart result: {result.stdout} {result.stderr}")
+                    if SupervisorClient.restart():
+                        logger.info("[whatsapp-watcher] Gateway restarted successfully")
+                    else:
+                        logger.error("[whatsapp-watcher] Failed to restart gateway")
         except Exception as e:
-            logger.warning(f"[whatsapp-watcher] Error: {e}")
+            logger.warning("[whatsapp-watcher] Error: %s", e)
 
 
 @app.on_event("startup")
@@ -1327,6 +1336,16 @@ async def startup_event():
     global whatsapp_watcher_task, gateway_state
 
     logger.info("Server starting up...")
+
+    # Ensure MongoDB indexes exist for performance and session TTL cleanup
+    try:
+        await db.user_sessions.create_index("session_token", unique=True)
+        await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
+        await db.users.create_index("user_id", unique=True)
+        await db.users.create_index("email", unique=True)
+        logger.info("MongoDB indexes ensured")
+    except Exception as e:
+        logger.warning(f"Could not create MongoDB indexes: {e}")
 
     # Reload supervisor config to pick up any changes
     SupervisorClient.reload_config()
@@ -1381,7 +1400,7 @@ async def startup_event():
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
                 token = config.get("gateway", {}).get("auth", {}).get("token")
-            except:
+            except (OSError, json.JSONDecodeError, ValueError, AttributeError):
                 token = generate_token()
 
         # Write env file for supervisor wrapper
