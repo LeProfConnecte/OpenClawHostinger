@@ -1,10 +1,15 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request, Response, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
+import hashlib
 import os
+import re
+import shutil
 import logging
 import json
 import secrets
@@ -14,10 +19,12 @@ import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import List, Literal, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+import time
 
 # WhatsApp monitoring
 from whatsapp_monitor import get_whatsapp_status, fix_registered_flag
@@ -30,14 +37,20 @@ load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'moltbot_app')]
+mongo_client = AsyncIOMotorClient(mongo_url)
+db = mongo_client[os.environ.get('DB_NAME', 'moltbot_app')]
 
-# Create the main app without a prefix
-app = FastAPI()
+# Shared httpx client (H5: reuse across requests instead of creating per-request)
+_http_client: Optional[httpx.AsyncClient] = None
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+
+def get_http_client() -> httpx.AsyncClient:
+    """Get the shared httpx AsyncClient instance."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=30.0)
+    return _http_client
+
 
 # Moltbot Gateway Management
 MOLTBOT_PORT = 18789
@@ -62,24 +75,91 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============== Rate Limiter (H3) ==============
+
+class RateLimiter:
+    """Simple in-memory rate limiter per IP address."""
+
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: dict[str, list[float]] = defaultdict(list)
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        window_start = now - self.window_seconds
+        # Clean old entries
+        self._requests[key] = [t for t in self._requests[key] if t > window_start]
+        if len(self._requests[key]) >= self.max_requests:
+            return False
+        self._requests[key].append(now)
+        return True
+
+
+auth_rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
+start_rate_limiter = RateLimiter(max_requests=5, window_seconds=60)
+
+
+def _mask_email(email: str) -> str:
+    """Mask email for safe logging (L8)."""
+    if not email or '@' not in email:
+        return '***'
+    local, domain = email.rsplit('@', 1)
+    masked_local = local[0] + '***' if local else '***'
+    return f"{masked_local}@{domain}"
+
+
+def _hash_token(token: str) -> str:
+    """Hash a token for safe storage in database (C3)."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
 
 # ============== Pydantic Models ==============
 
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
+    client_name: str = Field(max_length=255)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StatusCheckCreate(BaseModel):
-    client_name: str
+    client_name: str = Field(max_length=255, min_length=1)
+
+    @field_validator('client_name')
+    @classmethod
+    def validate_client_name(cls, v: str) -> str:
+        if not re.match(r'^[\w\s\-_.@]+$', v):
+            raise ValueError('client_name contains invalid characters')
+        return v.strip()
 
 
 class OpenClawStartRequest(BaseModel):
     provider: Literal["emergent", "anthropic", "openai", "openrouter"] = "emergent"
     apiKey: Optional[str] = None
     model: Optional[str] = None  # Optional model override (mainly for openrouter)
+
+    @field_validator('apiKey')
+    @classmethod
+    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) < 10:
+            raise ValueError('API key must be at least 10 characters')
+        if not re.match(r'^[a-zA-Z0-9\-_.:+/=]+$', v):
+            raise ValueError('API key contains invalid characters')
+        return v
+
+    @field_validator('model')
+    @classmethod
+    def validate_model(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 200:
+            raise ValueError('Model name too long')
+        if not re.match(r'^[\w\-./]+$', v):
+            raise ValueError('Model name contains invalid characters')
+        return v
 
 
 class OpenClawStartResponse(BaseModel):
@@ -109,7 +189,7 @@ class User(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(min_length=1, max_length=512)
 
 
 # ============== Authentication Helpers ==============
@@ -118,10 +198,12 @@ EMERGENT_AUTH_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/ses
 SESSION_EXPIRY_DAYS = 7
 
 # Cookie security configuration (configurable for dev/prod)
-# In production behind CloudPanel/Nginx with HTTPS: COOKIE_SECURE=true, COOKIE_SAMESITE=lax
-# In local dev without HTTPS: COOKIE_SECURE=false, COOKIE_SAMESITE=lax
 COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').lower() == 'true'
 COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'lax')
+
+# WebSocket limits (H8, H9)
+WS_MAX_MESSAGE_SIZE = 1 * 1024 * 1024  # 1MB
+WS_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
 
 async def get_instance_owner() -> Optional[dict]:
@@ -130,9 +212,10 @@ async def get_instance_owner() -> Optional[dict]:
     return doc
 
 
-async def set_instance_owner(user: User) -> None:
-    """Lock the instance to a specific user. Only succeeds if not already locked."""
-    await db.instance_config.update_one(
+async def set_instance_owner(user: User) -> bool:
+    """Lock the instance to a specific user. Only succeeds if not already locked.
+    Returns True if this user is the owner (either newly set or already was)."""
+    result = await db.instance_config.update_one(
         {"_id": "instance_owner"},
         {
             "$setOnInsert": {
@@ -144,13 +227,15 @@ async def set_instance_owner(user: User) -> None:
         },
         upsert=True
     )
+    # H2: Re-verify ownership after upsert to handle race condition
+    owner = await get_instance_owner()
+    return owner and owner.get("user_id") == user.user_id
 
 
 async def check_instance_access(user: User) -> bool:
     """Check if user is allowed to access this instance. Returns True if allowed."""
     owner = await get_instance_owner()
     if not owner:
-        # Instance not locked yet - anyone can access
         return True
     return owner.get("user_id") == user.user_id
 
@@ -161,21 +246,16 @@ async def get_current_user(request: Request) -> Optional[User]:
     Checks cookie first, then Authorization header as fallback.
     Returns None if not authenticated.
     """
-    session_token = None
-
-    # Check cookie first
     session_token = request.cookies.get("session_token")
 
-    # Fallback to Authorization header
     if not session_token:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
-            session_token = auth_header.split(" ")[1]
+            session_token = auth_header.split(" ", 1)[1]
 
     if not session_token:
         return None
 
-    # Look up session in database
     session_doc = await db.user_sessions.find_one(
         {"session_token": session_token},
         {"_id": 0}
@@ -184,7 +264,6 @@ async def get_current_user(request: Request) -> Optional[User]:
     if not session_doc:
         return None
 
-    # Check expiry
     expires_at = session_doc.get("expires_at")
     if isinstance(expires_at, str):
         expires_at = datetime.fromisoformat(expires_at)
@@ -194,7 +273,6 @@ async def get_current_user(request: Request) -> Optional[User]:
     if expires_at < datetime.now(timezone.utc):
         return None
 
-    # Get user
     user_doc = await db.users.find_one(
         {"user_id": session_doc["user_id"]},
         {"_id": 0}
@@ -211,8 +289,7 @@ async def require_auth(request: Request) -> User:
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    # Check if user is allowed to access this instance
+
     if not await check_instance_access(user):
         raise HTTPException(
             status_code=403,
@@ -255,6 +332,127 @@ async def get_ws_user(websocket: WebSocket) -> Optional[User]:
     return User(**user_doc)
 
 
+# ============== Lifespan (M1: replaces deprecated on_event) ==============
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: startup and shutdown logic."""
+    global _http_client
+    # --- STARTUP ---
+    logger.info("Server starting up...")
+
+    # Create shared httpx client (H5)
+    _http_client = httpx.AsyncClient(timeout=30.0)
+
+    # Ensure MongoDB indexes exist for performance and session TTL cleanup
+    try:
+        await db.user_sessions.create_index("session_token", unique=True)
+        await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
+        await db.users.create_index("user_id", unique=True)
+        await db.users.create_index("email", unique=True)
+        logger.info("MongoDB indexes ensured")
+    except Exception as e:
+        logger.warning(f"Could not create MongoDB indexes: {e}")
+
+    # Reload supervisor config to pick up any changes
+    await asyncio.to_thread(SupervisorClient.reload_config)
+
+    # Check and install Moltbot dependencies if needed
+    clawdbot_cmd = get_clawdbot_command()
+    if clawdbot_cmd:
+        logger.info(f"Moltbot dependencies ready: {clawdbot_cmd}")
+    else:
+        logger.info("Moltbot dependencies not found, will install on first use")
+
+    # Check database for persistent gateway config
+    config_doc = None
+    try:
+        config_doc = await db.moltbot_configs.find_one({"_id": "gateway_config"})
+    except Exception as e:
+        logger.warning(f"Could not read gateway config from database: {e}")
+
+    should_run = config_doc.get("should_run", False) if config_doc else False
+    logger.info(f"Gateway should_run flag: {should_run}")
+
+    # Check if gateway is already running via supervisor
+    is_running = await asyncio.to_thread(SupervisorClient.status)
+    if is_running:
+        pid = await asyncio.to_thread(SupervisorClient.get_pid)
+        logger.info(f"Gateway already running via supervisor (PID: {pid})")
+
+        gateway_state["provider"] = config_doc.get("provider", "emergent") if config_doc else "emergent"
+
+        # Recover token from config file (not from DB — DB only stores hash)
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            gateway_state["token"] = config.get("gateway", {}).get("auth", {}).get("token")
+            logger.info("Recovered gateway token from config file")
+        except Exception as e:
+            logger.warning(f"Could not recover gateway token: {e}")
+
+        if config_doc:
+            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
+            gateway_state["started_at"] = config_doc.get("started_at")
+            logger.info("Recovered gateway owner from database")
+
+    elif should_run and config_doc:
+        logger.info("Gateway should_run=True but not running - auto-starting via supervisor...")
+
+        # Recover token from config file
+        token = None
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            token = config.get("gateway", {}).get("auth", {}).get("token")
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+            token = generate_token()
+
+        if not token:
+            token = generate_token()
+
+        write_gateway_env(token=token, provider=config_doc.get("provider", "emergent"))
+
+        started = await asyncio.to_thread(SupervisorClient.start)
+        if started:
+            logger.info("Gateway auto-started successfully via supervisor")
+            await asyncio.sleep(3)
+
+            gateway_state["token"] = token
+            gateway_state["provider"] = config_doc.get("provider", "emergent")
+            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
+            gateway_state["started_at"] = config_doc.get("started_at")
+        else:
+            logger.error("Failed to auto-start gateway via supervisor")
+
+    # Start WhatsApp auto-fix background watcher
+    watcher_task = asyncio.create_task(whatsapp_auto_fix_watcher())
+    logger.info("[whatsapp-watcher] Background watcher task created (checks every 5s)")
+
+    yield  # --- APP RUNNING ---
+
+    # --- SHUTDOWN ---
+    watcher_task.cancel()
+    try:
+        await watcher_task
+    except asyncio.CancelledError:
+        pass
+
+    # Close shared httpx client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+
+    logger.info("Backend shutting down - gateway will continue running via supervisor")
+    mongo_client.close()
+
+
+# Create the main app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+
 # ============== Auth Endpoints ==============
 
 @api_router.get("/auth/instance")
@@ -270,23 +468,28 @@ async def get_instance_status():
 
 
 @api_router.post("/auth/session")
-async def create_session(request: SessionRequest, response: Response):
+async def create_session(request: SessionRequest, req: Request, response: Response):
     """
     Exchange session_id from Emergent Auth for a session token.
     Creates user if not exists, creates session, sets cookie.
     Blocks non-owners if instance is locked.
     """
+    # H3: Rate limiting
+    client_ip = req.headers.get("x-real-ip") or req.client.host if req.client else "unknown"
+    if not auth_rate_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
     try:
         # Call Emergent Auth to get user data
-        async with httpx.AsyncClient() as http_client:
-            auth_response = await http_client.get(
-                EMERGENT_AUTH_URL,
-                headers={"X-Session-ID": request.session_id},
-                timeout=10.0
-            )
+        http_client = get_http_client()
+        auth_response = await http_client.get(
+            EMERGENT_AUTH_URL,
+            headers={"X-Session-ID": request.session_id},
+            timeout=10.0
+        )
 
         if auth_response.status_code != 200:
-            logger.error(f"Emergent Auth error: {auth_response.status_code} - {auth_response.text}")
+            logger.error(f"Emergent Auth error: {auth_response.status_code}")
             raise HTTPException(status_code=401, detail="Invalid session_id")
 
         auth_data = auth_response.json()
@@ -297,41 +500,37 @@ async def create_session(request: SessionRequest, response: Response):
         if not email:
             raise HTTPException(status_code=400, detail="No email in auth response")
 
-        # Check if user exists first (needed for consistent instance lock check)
-        existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+        # H1: Use upsert to atomically create or find user (avoids race condition)
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        result = await db.users.update_one(
+            {"email": email},
+            {
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "email": email,
+                    "created_at": datetime.now(timezone.utc)
+                },
+                "$set": {"name": name, "picture": picture}
+            },
+            upsert=True
+        )
 
-        # Check if instance is locked to another user (by user_id if known, email as fallback)
+        # Fetch the actual user (whether newly created or existing)
+        user_doc = await db.users.find_one({"email": email}, {"_id": 0})
+        user_id = user_doc["user_id"]
+
+        # Check if instance is locked to another user
         owner = await get_instance_owner()
-        if owner:
-            is_owner = False
-            if existing_user:
-                is_owner = owner.get("user_id") == existing_user["user_id"]
-            else:
-                is_owner = owner.get("email") == email
-            if not is_owner:
-                logger.warning(f"Blocked login attempt from {email} - instance locked to {owner.get('email')}")
+        if owner and owner.get("user_id") != user_id:
+            if owner.get("email") != email:
+                logger.warning(f"Blocked login attempt from {_mask_email(email)} - instance locked")
                 raise HTTPException(
                     status_code=403,
                     detail="This instance is private and locked to the owner. Access denied."
                 )
 
-        if existing_user:
-            user_id = existing_user["user_id"]
-            # Update user info
-            await db.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"name": name, "picture": picture}}
-            )
-        else:
-            # Create new user
-            user_id = f"user_{uuid.uuid4().hex[:12]}"
-            await db.users.insert_one({
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "picture": picture,
-                "created_at": datetime.now(timezone.utc)
-            })
+        # H4: Invalidate old sessions for this user before creating new one
+        await db.user_sessions.delete_many({"user_id": user_id})
 
         # Create session
         session_token = secrets.token_hex(32)
@@ -354,9 +553,6 @@ async def create_session(request: SessionRequest, response: Response):
             path="/",
             max_age=SESSION_EXPIRY_DAYS * 24 * 60 * 60
         )
-
-        # Get user data
-        user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
 
         return {
             "ok": True,
@@ -399,24 +595,21 @@ async def logout(request: Request, response: Response):
 
 # ============== Moltbot Helpers ==============
 
-# Persistent paths for Node.js and clawdbot
+# Persistent paths for Node.js and clawdbot (M11: top-level import for shutil)
 _home = os.environ.get("HOME", "/root")
 NODE_DIR = os.environ.get("NODE_DIR") or os.path.join(_home, "nodejs")
 CLAWDBOT_DIR = os.environ.get("CLAWDBOT_BIN_DIR") or os.path.join(_home, ".clawdbot-bin")
 CLAWDBOT_WRAPPER = os.environ.get("CLAWDBOT_WRAPPER") or os.path.join(_home, "run_clawdbot.sh")
 
+
 def get_clawdbot_command():
     """Get the path to clawdbot executable"""
-    # Try wrapper script first
     if os.path.exists(CLAWDBOT_WRAPPER):
         return CLAWDBOT_WRAPPER
-    # Try persistent location
     if os.path.exists(f"{CLAWDBOT_DIR}/clawdbot"):
         return f"{CLAWDBOT_DIR}/clawdbot"
     if os.path.exists(f"{NODE_DIR}/bin/clawdbot"):
         return f"{NODE_DIR}/bin/clawdbot"
-    # Try system path
-    import shutil
     clawdbot_path = shutil.which("clawdbot")
     if clawdbot_path:
         return clawdbot_path
@@ -425,15 +618,14 @@ def get_clawdbot_command():
 
 def ensure_moltbot_installed():
     """Ensure Moltbot dependencies are installed"""
-    install_script = "/app/backend/install_moltbot_deps.sh"
+    # M5: Use relative path from ROOT_DIR instead of hardcoded /app/backend/
+    install_script = str(ROOT_DIR / "install_moltbot_deps.sh")
 
-    # Check if clawdbot is available
     clawdbot_cmd = get_clawdbot_command()
     if clawdbot_cmd:
         logger.info(f"Clawdbot found at: {clawdbot_cmd}")
         return True
 
-    # Run installation script if available
     if os.path.exists(install_script):
         logger.info("Clawdbot not found, running installation script...")
         try:
@@ -463,22 +655,14 @@ def generate_token():
 
 
 def create_moltbot_config(token: str = None, api_key: str = None, provider: str = "emergent", force_new_token: bool = False, model: str = None):
-    """Update clawdbot.json with gateway config and provider settings
+    """Update clawdbot.json with gateway config and provider settings.
 
-    Args:
-        token: Optional token. If not provided, reuses existing or generates new.
-        api_key: Optional API key for provider.
-        provider: The LLM provider - "emergent", "openai", "anthropic", or "openrouter".
-        force_new_token: If True, always generates a new token (triggers gateway restart).
-        model: Optional model override (mainly for openrouter).
-
-    Returns:
-        The token being used (existing or new).
+    C5: API keys for non-emergent providers are stored ONLY in gateway.env,
+    not in the JSON config file. The JSON uses env var references.
     """
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
-    # Load existing config if present
     existing_config = {}
     if os.path.exists(CONFIG_FILE):
         try:
@@ -487,7 +671,6 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         except (OSError, json.JSONDecodeError, ValueError):
             pass
 
-    # Reuse existing token if available (to avoid triggering gateway restart)
     existing_token = None
     if not force_new_token:
         try:
@@ -495,12 +678,10 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         except (AttributeError, TypeError):
             pass
 
-    # Use existing token, provided token, or generate new
     final_token = existing_token or token or generate_token()
 
     logger.info(f"Config token: {'reusing existing' if existing_token else 'new token'}, provider: {provider}")
 
-    # Gateway config to merge
     gateway_config = {
         "mode": "local",
         "port": MOLTBOT_PORT,
@@ -515,30 +696,27 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
     }
 
-    # Merge config - preserve existing settings, update gateway
     existing_config["gateway"] = gateway_config
 
-    # Ensure models section exists with merge mode
     if "models" not in existing_config:
         existing_config["models"] = {"mode": "merge", "providers": {}}
     existing_config["models"]["mode"] = "merge"
     if "providers" not in existing_config["models"]:
         existing_config["models"]["providers"] = {}
 
-    # Ensure agents defaults section exists
     if "agents" not in existing_config:
         existing_config["agents"] = {"defaults": {}}
     if "defaults" not in existing_config["agents"]:
         existing_config["agents"]["defaults"] = {}
     existing_config["agents"]["defaults"]["workspace"] = WORKSPACE_DIR
 
-    # Configure providers based on selection
+    # C5: Use env var references for API keys in JSON config (not plaintext)
+    _env_api_key_ref = "${PROVIDER_API_KEY}"
+
     if provider == "emergent":
-        # Use Emergent's proxy for both GPT and Claude
         emergent_key = api_key or os.environ.get('EMERGENT_API_KEY', 'sk-emergent-1234')
         emergent_base_url = os.environ.get('EMERGENT_BASE_URL', 'https://integrations.emergentagent.com/llm')
 
-        # Emergent GPT provider (openai-completions API)
         emergent_gpt_provider = {
             "baseUrl": f"{emergent_base_url}/",
             "apiKey": emergent_key,
@@ -561,7 +739,6 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
             ]
         }
 
-        # Emergent Claude provider (anthropic-messages API with authHeader)
         emergent_claude_provider = {
             "baseUrl": emergent_base_url,
             "apiKey": emergent_key,
@@ -590,7 +767,6 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         existing_config["models"]["providers"]["emergent-gpt"] = emergent_gpt_provider
         existing_config["models"]["providers"]["emergent-claude"] = emergent_claude_provider
 
-        # Set primary model to Claude Sonnet
         existing_config["agents"]["defaults"]["models"] = {
             "emergent-gpt/gpt-5.2": {"alias": "gpt-5.2"},
             "emergent-claude/claude-sonnet-4-5": {"alias": "sonnet"}
@@ -600,10 +776,10 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
 
     elif provider == "openai":
-        # Direct OpenAI API with user's own key
+        # C5: Don't store API key in JSON — use env var reference
         openai_provider = {
             "baseUrl": "https://api.openai.com/v1/",
-            "apiKey": api_key,
+            "apiKey": _env_api_key_ref,
             "api": "openai-completions",
             "models": [
                 {
@@ -648,8 +824,6 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
 
         existing_config["models"]["providers"]["openai"] = openai_provider
-
-        # Set primary model to GPT-5.2
         existing_config["agents"]["defaults"]["models"] = {
             "openai/gpt-5.2": {"alias": "gpt-5.2"}
         }
@@ -658,10 +832,9 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
 
     elif provider == "anthropic":
-        # Direct Anthropic API with user's own key
         anthropic_provider = {
             "baseUrl": "https://api.anthropic.com",
-            "apiKey": api_key,
+            "apiKey": _env_api_key_ref,
             "api": "anthropic-messages",
             "models": [
                 {
@@ -676,8 +849,6 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
 
         existing_config["models"]["providers"]["anthropic"] = anthropic_provider
-
-        # Set primary model to Claude Opus 4.5
         existing_config["agents"]["defaults"]["models"] = {
             "anthropic/claude-opus-4-5-20251101": {"alias": "opus"}
         }
@@ -686,21 +857,17 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
         }
 
     elif provider == "openrouter":
-        # OpenRouter - configure as a proper provider
-        # Use provided model or default to auto
         model_slug = model if model else "openrouter/auto"
-        
-        # Extract the model ID (remove openrouter/ prefix if present)
+
         if model_slug.startswith("openrouter/"):
             model_id = model_slug[len("openrouter/"):]
         else:
             model_id = model_slug
             model_slug = f"openrouter/{model_id}"
-        
-        # Configure OpenRouter as a provider
+
         openrouter_provider = {
             "baseUrl": "https://openrouter.ai/api/v1/",
-            "apiKey": api_key,
+            "apiKey": _env_api_key_ref,
             "api": "openai-completions",
             "models": [
                 {
@@ -712,15 +879,9 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
                 }
             ]
         }
-        
+
         existing_config["models"]["providers"]["openrouter"] = openrouter_provider
-        
-        # Also store API key in env for other potential uses
-        if "env" not in existing_config:
-            existing_config["env"] = {}
-        existing_config["env"]["OPENROUTER_API_KEY"] = api_key
-        
-        # Set primary model
+
         existing_config["agents"]["defaults"]["models"] = {
             model_slug: {}
         }
@@ -731,33 +892,31 @@ def create_moltbot_config(token: str = None, api_key: str = None, provider: str 
     with open(CONFIG_FILE, "w") as f:
         json.dump(existing_config, f, indent=2)
 
-    # Set secure permissions - config contains API keys and tokens
     os.chmod(CONFIG_FILE, 0o600)
 
     logger.info(f"Updated Moltbot config at {CONFIG_FILE} for provider: {provider}")
-    return final_token  # Return the token being used
+    return final_token
 
 
 async def start_gateway_process(api_key: str, provider: str, owner_user_id: str, model: str = None):
     """Start the Moltbot gateway process via supervisor (persistent, survives backend restarts)"""
     global gateway_state
 
-    # Check if already running via supervisor
-    if SupervisorClient.status():
+    # Check if already running via supervisor (M7: run blocking call in thread)
+    is_running = await asyncio.to_thread(SupervisorClient.status)
+    if is_running:
         logger.info("Gateway already running via supervisor, applying new config and restarting...")
 
-        # Always apply the new configuration and restart
         token = create_moltbot_config(api_key=api_key, provider=provider, force_new_token=True, model=model)
-
-        # Write environment file for supervisor wrapper to load
         write_gateway_env(token=token, api_key=api_key, provider=provider)
 
-        # Restart the gateway to pick up the new config
-        if not SupervisorClient.restart():
+        restarted = await asyncio.to_thread(SupervisorClient.restart)
+        if not restarted:
             logger.warning("Failed to restart gateway via supervisor, trying stop+start...")
-            SupervisorClient.stop()
+            await asyncio.to_thread(SupervisorClient.stop)
             await asyncio.sleep(2)
-            if not SupervisorClient.start():
+            started = await asyncio.to_thread(SupervisorClient.start)
+            if not started:
                 raise HTTPException(status_code=500, detail="Failed to restart gateway with new configuration")
 
         gateway_state["token"] = token
@@ -765,7 +924,7 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
         gateway_state["started_at"] = datetime.now(timezone.utc).isoformat()
         gateway_state["owner_user_id"] = owner_user_id
 
-        # Update database
+        # C3: Store hashed token in database
         await db.moltbot_configs.update_one(
             {"_id": "gateway_config"},
             {
@@ -773,7 +932,7 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
                     "should_run": True,
                     "owner_user_id": owner_user_id,
                     "provider": provider,
-                    "token": token,
+                    "token_hash": _hash_token(token),
                     "started_at": gateway_state["started_at"],
                     "updated_at": datetime.now(timezone.utc)
                 }
@@ -783,7 +942,6 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
 
         return token
 
-    # Ensure clawdbot is installed
     clawdbot_cmd = get_clawdbot_command()
     if not clawdbot_cmd:
         if not ensure_moltbot_installed():
@@ -792,19 +950,15 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
         if not clawdbot_cmd:
             raise HTTPException(status_code=500, detail="Failed to find clawdbot after installation")
 
-    # Create config (reuses existing token to avoid gateway restarts)
     token = create_moltbot_config(api_key=api_key, provider=provider, model=model)
-
-    # Write environment file for supervisor wrapper to load
     write_gateway_env(token=token, api_key=api_key, provider=provider)
 
     logger.info(f"Starting Moltbot gateway via supervisor on port {MOLTBOT_PORT}...")
 
-    # Start via supervisor (will auto-restart on crash, survives backend restarts)
-    if not SupervisorClient.start():
+    started = await asyncio.to_thread(SupervisorClient.start)
+    if not started:
         raise HTTPException(status_code=500, detail="Failed to start gateway via supervisor")
 
-    # Update in-memory state
     gateway_state["token"] = token
     gateway_state["provider"] = provider
     gateway_state["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -815,44 +969,44 @@ async def start_gateway_process(api_key: str, provider: str, owner_user_id: str,
     loop = asyncio.get_running_loop()
     start_time = loop.time()
 
-    async with httpx.AsyncClient() as http_client:
-        while loop.time() - start_time < max_wait:
-            try:
-                response = await http_client.get(f"http://127.0.0.1:{MOLTBOT_PORT}/", timeout=2.0)
-                if response.status_code == 200:
-                    logger.info("Moltbot gateway is ready!")
+    http_client = get_http_client()
+    while loop.time() - start_time < max_wait:
+        try:
+            resp = await http_client.get(f"http://127.0.0.1:{MOLTBOT_PORT}/", timeout=2.0)
+            if resp.status_code == 200:
+                logger.info("Moltbot gateway is ready!")
 
-                    # Store config in database for persistence (with should_run flag)
-                    await db.moltbot_configs.update_one(
-                        {"_id": "gateway_config"},
-                        {
-                            "$set": {
-                                "should_run": True,
-                                "owner_user_id": owner_user_id,
-                                "provider": provider,
-                                "token": token,
-                                "started_at": gateway_state["started_at"],
-                                "updated_at": datetime.now(timezone.utc)
-                            }
-                        },
-                        upsert=True
-                    )
+                # C3: Store hashed token in database
+                await db.moltbot_configs.update_one(
+                    {"_id": "gateway_config"},
+                    {
+                        "$set": {
+                            "should_run": True,
+                            "owner_user_id": owner_user_id,
+                            "provider": provider,
+                            "token_hash": _hash_token(token),
+                            "started_at": gateway_state["started_at"],
+                            "updated_at": datetime.now(timezone.utc)
+                        }
+                    },
+                    upsert=True
+                )
 
-                    return token
-            except Exception:
-                pass
-            await asyncio.sleep(1)
+                return token
+        except Exception:
+            pass
+        await asyncio.sleep(1)
 
-    # Check supervisor status if not ready
-    if not SupervisorClient.status():
+    sv_running = await asyncio.to_thread(SupervisorClient.status)
+    if not sv_running:
         raise HTTPException(status_code=500, detail="Gateway failed to start via supervisor")
 
     raise HTTPException(status_code=500, detail="Gateway did not become ready in time")
 
 
-def check_gateway_running():
-    """Check if the gateway process is still running via supervisor"""
-    return SupervisorClient.status()
+async def check_gateway_running():
+    """Check if the gateway process is still running via supervisor (M7: async)"""
+    return await asyncio.to_thread(SupervisorClient.status)
 
 
 # ============== Moltbot API Endpoints (Protected) ==============
@@ -864,18 +1018,21 @@ async def root():
 
 @api_router.post("/openclaw/start", response_model=OpenClawStartResponse)
 async def start_moltbot(request: OpenClawStartRequest, req: Request):
-    """Start the Moltbot gateway with Emergent provider (requires auth)"""
+    """Start the Moltbot gateway with chosen provider (requires auth)"""
+    # H3: Rate limiting
+    client_ip = req.headers.get("x-real-ip") or req.client.host if req.client else "unknown"
+    if not start_rate_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
     user = await require_auth(req)
 
-    if request.provider not in ["emergent", "anthropic", "openai", "openrouter"]:
-        raise HTTPException(status_code=400, detail="Invalid provider. Use 'emergent', 'anthropic', 'openai', or 'openrouter'")
-
-    # For non-emergent providers, API key is required
-    if request.provider in ["anthropic", "openai", "openrouter"] and (not request.apiKey or len(request.apiKey) < 10):
+    # For non-emergent providers, API key is required (validation done by Pydantic M2)
+    if request.provider in ["anthropic", "openai", "openrouter"] and not request.apiKey:
         raise HTTPException(status_code=400, detail="API key required for anthropic/openai/openrouter providers")
 
     # Check if Moltbot is already running by another user
-    if check_gateway_running() and gateway_state["owner_user_id"] != user.user_id:
+    running = await check_gateway_running()
+    if running and gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(
             status_code=403,
             detail="OpenClaw is already running by another user. Please wait for them to stop it."
@@ -884,15 +1041,18 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
     try:
         token = await start_gateway_process(request.apiKey, request.provider, user.user_id, request.model)
 
-        # Lock the instance to this user on first successful start
-        await set_instance_owner(user)
-        logger.info(f"Instance locked to user: {user.email}")
+        # H2: Verify ownership was actually set correctly
+        is_owner = await set_instance_owner(user)
+        if not is_owner:
+            logger.warning(f"Instance lock race: user {_mask_email(user.email)} was not set as owner")
+
+        logger.info(f"Instance locked to user: {_mask_email(user.email)}")
 
         return OpenClawStartResponse(
             ok=True,
             controlUrl="/api/openclaw/ui/",
             token=token,
-            message="OpenClaw started successfully with Emergent provider"
+            message=f"OpenClaw started successfully with {request.provider} provider"
         )
     except HTTPException:
         raise
@@ -903,19 +1063,17 @@ async def start_moltbot(request: OpenClawStartRequest, req: Request):
 
 @api_router.get("/openclaw/status", response_model=OpenClawStatusResponse)
 async def get_moltbot_status(request: Request):
-    """Get the current status of the Moltbot gateway.
-    Sensitive metadata (owner_user_id, provider, pid) is only exposed to the authenticated owner.
-    """
+    """Get the current status of the Moltbot gateway."""
     user = await get_current_user(request)
-    running = check_gateway_running()
+    running = await check_gateway_running()
 
     if running:
         is_owner = bool(user and gateway_state["owner_user_id"] == user.user_id)
         if is_owner:
-            # Owner gets full details
+            pid = await asyncio.to_thread(SupervisorClient.get_pid)
             return OpenClawStatusResponse(
                 running=True,
-                pid=SupervisorClient.get_pid(),
+                pid=pid,
                 provider=gateway_state["provider"],
                 started_at=gateway_state["started_at"],
                 controlUrl="/api/openclaw/ui/",
@@ -923,7 +1081,6 @@ async def get_moltbot_status(request: Request):
                 is_owner=True
             )
         else:
-            # Non-owner or unauthenticated: only reveal running status
             return OpenClawStatusResponse(
                 running=True,
                 is_owner=False if user else None
@@ -936,7 +1093,8 @@ async def get_moltbot_status(request: Request):
 async def get_whatsapp_connection_status(request: Request):
     """Get basic WhatsApp connection status. Requires authentication."""
     await require_auth(request)
-    return get_whatsapp_status()
+    # M3: Run blocking I/O in thread
+    return await asyncio.to_thread(get_whatsapp_status)
 
 
 @api_router.post("/openclaw/stop")
@@ -946,32 +1104,26 @@ async def stop_moltbot(request: Request):
 
     global gateway_state
 
-    if not check_gateway_running():
-        # Clear should_run flag even if not running
+    running = await check_gateway_running()
+    if not running:
         await db.moltbot_configs.update_one(
             {"_id": "gateway_config"},
             {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}}
         )
         return {"ok": True, "message": "OpenClaw is not running"}
 
-    # Check if user is the owner
     if gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(status_code=403, detail="Only the owner can stop OpenClaw")
 
-    # Stop via supervisor
-    if not SupervisorClient.stop():
-        logger.error("Failed to stop gateway via supervisor")
+    await asyncio.to_thread(SupervisorClient.stop)
 
-    # Clear the gateway env file
     clear_gateway_env()
 
-    # Clear should_run flag in database
     await db.moltbot_configs.update_one(
         {"_id": "gateway_config"},
         {"$set": {"should_run": False, "updated_at": datetime.now(timezone.utc)}}
     )
 
-    # Clear in-memory state
     gateway_state["token"] = None
     gateway_state["provider"] = None
     gateway_state["started_at"] = None
@@ -985,10 +1137,10 @@ async def get_moltbot_token(request: Request):
     """Get the current gateway token for authentication (only owner)"""
     user = await require_auth(request)
 
-    if not check_gateway_running():
+    running = await check_gateway_running()
+    if not running:
         raise HTTPException(status_code=404, detail="OpenClaw not running")
 
-    # Only owner can get the token
     if gateway_state["owner_user_id"] != user.user_id:
         raise HTTPException(status_code=403, detail="Only the owner can access the token")
 
@@ -1002,13 +1154,13 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
     """Proxy requests to the Moltbot Control UI (only owner can access)"""
     user = await get_current_user(request)
 
-    if not check_gateway_running():
+    running = await check_gateway_running()
+    if not running:
         return HTMLResponse(
             content="<html><body><h1>OpenClaw not running</h1><p>Please start OpenClaw first.</p><a href='/'>Go to setup</a></body></html>",
             status_code=503
         )
 
-    # Check if user is the owner
     if not user or gateway_state["owner_user_id"] != user.user_id:
         return HTMLResponse(
             content="<html><body><h1>Access Denied</h1><p>This OpenClaw instance is owned by another user.</p><a href='/'>Go back</a></body></html>",
@@ -1017,45 +1169,40 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
 
     target_url = f"http://127.0.0.1:{MOLTBOT_PORT}/{path}"
 
-    # Handle query string
     if request.query_params:
         target_url += f"?{request.query_params}"
 
-    async with httpx.AsyncClient() as http_client:
-        try:
-            # Forward the request, stripping sensitive headers
-            headers = dict(request.headers)
-            headers.pop("host", None)
-            headers.pop("content-length", None)
-            headers.pop("cookie", None)
-            headers.pop("authorization", None)
+    # H5: Use shared httpx client
+    http_client = get_http_client()
+    try:
+        headers = dict(request.headers)
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        headers.pop("cookie", None)
+        headers.pop("authorization", None)
 
-            body = await request.body()
+        body = await request.body()
 
-            response = await http_client.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                content=body,
-                timeout=30.0
-            )
+        response = await http_client.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            content=body,
+            timeout=30.0
+        )
 
-            # Filter response headers
-            exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection", "www-authenticate"}
-            response_headers = {
-                k: v for k, v in response.headers.items()
-                if k.lower() not in exclude_headers
-            }
+        exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection", "www-authenticate"}
+        response_headers = {
+            k: v for k, v in response.headers.items()
+            if k.lower() not in exclude_headers
+        }
 
-            # Get content and rewrite WebSocket URLs if HTML
-            content = response.content
-            content_type = response.headers.get("content-type", "")
+        content = response.content
+        content_type = response.headers.get("content-type", "")
 
-            # If it's HTML, rewrite any WebSocket URLs to use our proxy
-            if "text/html" in content_type:
-                content_str = content.decode('utf-8', errors='ignore')
-                # Inject WebSocket URL override script (auth via cookies, no token in page source)
-                ws_override = '''
+        if "text/html" in content_type:
+            content_str = content.decode('utf-8', errors='ignore')
+            ws_override = '''
 <script>
 // OpenClaw Proxy Configuration
 window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host + '/api/openclaw/ws';
@@ -1097,27 +1244,26 @@ window.__MOLTBOT_PROXY_WS_URL__ = (window.location.protocol === 'https:' ? 'wss:
 })();
 </script>
 '''
-                # Insert before </head> or at start of <body>
-                if '</head>' in content_str:
-                    content_str = content_str.replace('</head>', ws_override + '</head>')
-                elif '<body>' in content_str:
-                    content_str = content_str.replace('<body>', '<body>' + ws_override)
-                else:
-                    content_str = ws_override + content_str
-                content = content_str.encode('utf-8')
+            if '</head>' in content_str:
+                content_str = content_str.replace('</head>', ws_override + '</head>')
+            elif '<body>' in content_str:
+                content_str = content_str.replace('<body>', '<body>' + ws_override)
+            else:
+                content_str = ws_override + content_str
+            content = content_str.encode('utf-8')
 
-            return Response(
-                content=content,
-                status_code=response.status_code,
-                headers=response_headers,
-                media_type=response.headers.get("content-type")
-            )
-        except httpx.RequestError as e:
-            logger.error(f"Proxy error: {e}")
-            raise HTTPException(status_code=502, detail="Failed to connect to OpenClaw")
+        return Response(
+            content=content,
+            status_code=response.status_code,
+            headers=response_headers,
+            media_type=response.headers.get("content-type")
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to connect to OpenClaw")
 
 
-# Root proxy for Moltbot UI (handles /api/moltbot/ui without trailing path)
+# Root proxy for Moltbot UI
 @api_router.get("/openclaw/ui")
 async def proxy_moltbot_ui_root(request: Request):
     """Redirect to Moltbot UI with trailing slash"""
@@ -1134,30 +1280,30 @@ async def websocket_proxy(websocket: WebSocket):
     # Authenticate BEFORE accepting the WebSocket connection
     user = await get_ws_user(websocket)
     if not user:
+        # M13: Accept then close for compatibility with all ASGI servers
+        await websocket.accept()
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    # Verify the user is the instance owner
     if gateway_state.get("owner_user_id") != user.user_id:
+        await websocket.accept()
         await websocket.close(code=4003, reason="Access denied: not the instance owner")
         return
 
-    if not check_gateway_running():
+    running = await check_gateway_running()
+    if not running:
+        await websocket.accept()
         await websocket.close(code=1013, reason="OpenClaw not running")
         return
 
     await websocket.accept()
 
-    # Get the token from state
     token = gateway_state.get("token")
-
-    # Moltbot expects WebSocket connection with optional auth in query params
     moltbot_ws_url = f"ws://127.0.0.1:{MOLTBOT_PORT}/"
 
-    logger.info(f"WebSocket proxy connecting to: {moltbot_ws_url}")
+    logger.info("WebSocket proxy connecting to Moltbot gateway")
 
     try:
-        # Additional headers for connection
         extra_headers = {}
         if token:
             extra_headers["X-Auth-Token"] = token
@@ -1167,21 +1313,41 @@ async def websocket_proxy(websocket: WebSocket):
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
+            max_size=WS_MAX_MESSAGE_SIZE,  # H8: Message size limit
             additional_headers=extra_headers if extra_headers else None
         ) as moltbot_ws:
 
             async def client_to_moltbot():
+                last_activity = time.monotonic()
                 try:
                     while True:
                         try:
-                            data = await websocket.receive()
+                            # H9: Idle timeout check
+                            remaining = WS_IDLE_TIMEOUT - (time.monotonic() - last_activity)
+                            if remaining <= 0:
+                                logger.info("WebSocket idle timeout reached")
+                                break
+
+                            data = await asyncio.wait_for(
+                                websocket.receive(),
+                                timeout=min(remaining, 60)
+                            )
+                            last_activity = time.monotonic()
+
                             if data["type"] == "websocket.receive":
+                                # H8: Check message size
+                                msg = data.get("text") or data.get("bytes", b"")
+                                if len(msg) > WS_MAX_MESSAGE_SIZE:
+                                    logger.warning("WebSocket message too large, dropping")
+                                    continue
                                 if "text" in data:
                                     await moltbot_ws.send(data["text"])
                                 elif "bytes" in data:
                                     await moltbot_ws.send(data["bytes"])
                             elif data["type"] == "websocket.disconnect":
                                 break
+                        except asyncio.TimeoutError:
+                            continue
                         except WebSocketDisconnect:
                             break
                 except Exception as e:
@@ -1200,7 +1366,6 @@ async def websocket_proxy(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Moltbot to client error: {e}")
 
-            # Run both directions concurrently
             done, pending = await asyncio.wait(
                 [
                     asyncio.create_task(client_to_moltbot()),
@@ -1209,9 +1374,10 @@ async def websocket_proxy(websocket: WebSocket):
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # Cancel pending tasks
+            # H10: Properly await cancelled tasks
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     except Exception as e:
         logger.error(f"WebSocket proxy error: {e}")
@@ -1237,9 +1403,15 @@ async def create_status_check(input: StatusCheckCreate):
     return status_obj
 
 
+# M8: Add pagination
 @api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
+async def get_status_checks(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0)
+):
+    status_checks = await db.status_checks.find(
+        {}, {"_id": 0}
+    ).skip(offset).limit(limit).to_list(limit)
 
     for check in status_checks:
         if isinstance(check['timestamp'], str):
@@ -1251,38 +1423,63 @@ async def get_status_checks():
 # Include the router in the main app
 app.include_router(api_router)
 
-# CSRF protection middleware - validates Origin header on state-changing requests
-# Combined with SameSite=Lax cookies, this provides robust CSRF protection
+# C2: CSRF protection middleware - validates Origin AND Referer headers
 @app.middleware("http")
 async def csrf_protection(request: Request, call_next):
     if request.method in ("POST", "PUT", "DELETE", "PATCH"):
         origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+
+        # Build expected same-origin from request headers
+        host = request.headers.get("host", "")
+        forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        expected_origin = f"{forwarded_proto}://{host}"
+
+        # Collect allowed origins: same-origin + configured CORS origins
+        allowed = {expected_origin}
+        cors_env = os.environ.get('CORS_ORIGINS', '')
+        if cors_env and cors_env.strip() != '*':
+            for o in cors_env.split(','):
+                o = o.strip()
+                if o:
+                    allowed.add(o)
+
         if origin:
-            # Build expected same-origin from request headers
-            host = request.headers.get("host", "")
-            forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-            expected_origin = f"{forwarded_proto}://{host}"
-
-            # Collect allowed origins: same-origin + configured CORS origins
-            allowed = {expected_origin}
-            cors_env = os.environ.get('CORS_ORIGINS', '')
-            if cors_env and cors_env.strip() != '*':
-                for o in cors_env.split(','):
-                    o = o.strip()
-                    if o:
-                        allowed.add(o)
-
+            # Check Origin header
             if origin not in allowed:
-                logger.warning(f"CSRF: blocked request from origin={origin}, allowed={allowed}")
+                logger.warning(f"CSRF: blocked request from origin={origin}")
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "CSRF validation failed: origin not allowed"}
                 )
+        elif referer:
+            # Fallback: check Referer header
+            referer_origin = referer.split('/', 3)
+            if len(referer_origin) >= 3:
+                referer_origin = '/'.join(referer_origin[:3])
+            else:
+                referer_origin = referer
+            if referer_origin not in allowed:
+                logger.warning(f"CSRF: blocked request with referer={referer_origin}")
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "CSRF validation failed: referer not allowed"}
+                )
+        else:
+            # C2: Neither Origin nor Referer present — block state-changing requests
+            # Exception: allow requests that use Bearer token auth (API clients)
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header.startswith("Bearer "):
+                logger.warning("CSRF: blocked request with no Origin or Referer header")
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "CSRF validation failed: Origin or Referer header required"}
+                )
+
     return await call_next(request)
 
 
-# CORS configuration - CORS_ORIGINS must be set explicitly in production
-# Example: CORS_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+# CORS configuration
 _cors_origins_raw = os.environ.get('CORS_ORIGINS', '').strip()
 _cors_allow_credentials = True
 
@@ -1296,7 +1493,6 @@ if _cors_origins_raw == '*':
 elif _cors_origins_raw:
     _cors_origins = [o.strip() for o in _cors_origins_raw.split(',') if o.strip()]
 else:
-    # Default: empty list = same-origin only (no cross-origin allowed)
     _cors_origins = []
 
 app.add_middleware(
@@ -1309,138 +1505,24 @@ app.add_middleware(
 
 
 # Background task for auto-fixing WhatsApp
-whatsapp_watcher_task = None
-
 async def whatsapp_auto_fix_watcher():
     """Auto-fix Baileys registered=false bug every 5 seconds."""
     logger.info("[whatsapp-watcher] Background watcher started")
     while True:
         await asyncio.sleep(5)
         try:
-            status = get_whatsapp_status()
+            # M3: Run blocking I/O in thread
+            status = await asyncio.to_thread(get_whatsapp_status)
             if status["linked"] and not status["registered"]:
                 logger.info("[whatsapp-watcher] DETECTED registered=false, applying fix...")
-                if fix_registered_flag():
+                fixed = await asyncio.to_thread(fix_registered_flag)
+                if fixed:
                     logger.info("[whatsapp-watcher] Fix applied, restarting gateway via supervisor...")
-                    if SupervisorClient.restart():
+                    # M7: Run blocking subprocess in thread
+                    restarted = await asyncio.to_thread(SupervisorClient.restart)
+                    if restarted:
                         logger.info("[whatsapp-watcher] Gateway restarted successfully")
                     else:
                         logger.error("[whatsapp-watcher] Failed to restart gateway")
         except Exception as e:
             logger.warning("[whatsapp-watcher] Error: %s", e)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Run on server startup - ensure Moltbot dependencies are installed and auto-start gateway if needed"""
-    global whatsapp_watcher_task, gateway_state
-
-    logger.info("Server starting up...")
-
-    # Ensure MongoDB indexes exist for performance and session TTL cleanup
-    try:
-        await db.user_sessions.create_index("session_token", unique=True)
-        await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
-        await db.users.create_index("user_id", unique=True)
-        await db.users.create_index("email", unique=True)
-        logger.info("MongoDB indexes ensured")
-    except Exception as e:
-        logger.warning(f"Could not create MongoDB indexes: {e}")
-
-    # Reload supervisor config to pick up any changes
-    SupervisorClient.reload_config()
-
-    # Check and install Moltbot dependencies if needed
-    clawdbot_cmd = get_clawdbot_command()
-    if clawdbot_cmd:
-        logger.info(f"Moltbot dependencies ready: {clawdbot_cmd}")
-    else:
-        logger.info("Moltbot dependencies not found, will install on first use")
-
-    # Check database for persistent gateway config
-    config_doc = None
-    try:
-        config_doc = await db.moltbot_configs.find_one({"_id": "gateway_config"})
-    except Exception as e:
-        logger.warning(f"Could not read gateway config from database: {e}")
-
-    should_run = config_doc.get("should_run", False) if config_doc else False
-    logger.info(f"Gateway should_run flag: {should_run}")
-
-    # Check if gateway is already running via supervisor
-    if SupervisorClient.status():
-        pid = SupervisorClient.get_pid()
-        logger.info(f"Gateway already running via supervisor (PID: {pid})")
-
-        gateway_state["provider"] = config_doc.get("provider", "emergent") if config_doc else "emergent"
-
-        # Recover token from config file
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-            gateway_state["token"] = config.get("gateway", {}).get("auth", {}).get("token")
-            logger.info("Recovered gateway token from config file")
-        except Exception as e:
-            logger.warning(f"Could not recover gateway token: {e}")
-
-        # Recover owner info from database
-        if config_doc:
-            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
-            gateway_state["started_at"] = config_doc.get("started_at")
-            logger.info(f"Recovered gateway owner from database: {gateway_state['owner_user_id']}")
-
-    elif should_run and config_doc:
-        # Gateway should be running but isn't - auto-start it!
-        logger.info("Gateway should_run=True but not running - auto-starting via supervisor...")
-
-        # Recover token from config file or database
-        token = config_doc.get("token")
-        if not token:
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    config = json.load(f)
-                token = config.get("gateway", {}).get("auth", {}).get("token")
-            except (OSError, json.JSONDecodeError, ValueError, AttributeError):
-                token = generate_token()
-
-        # Write env file for supervisor wrapper
-        write_gateway_env(token=token, provider=config_doc.get("provider", "emergent"))
-
-        # Start via supervisor
-        if SupervisorClient.start():
-            logger.info("Gateway auto-started successfully via supervisor")
-
-            # Wait briefly for it to be ready
-            await asyncio.sleep(3)
-
-            gateway_state["token"] = token
-            gateway_state["provider"] = config_doc.get("provider", "emergent")
-            gateway_state["owner_user_id"] = config_doc.get("owner_user_id")
-            gateway_state["started_at"] = config_doc.get("started_at")
-        else:
-            logger.error("Failed to auto-start gateway via supervisor")
-
-    # Start WhatsApp auto-fix background watcher
-    whatsapp_watcher_task = asyncio.create_task(whatsapp_auto_fix_watcher())
-    logger.info("[whatsapp-watcher] Background watcher task created (checks every 5s)")
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    global whatsapp_watcher_task
-
-    # Stop WhatsApp watcher task
-    if whatsapp_watcher_task:
-        whatsapp_watcher_task.cancel()
-        try:
-            await whatsapp_watcher_task
-        except asyncio.CancelledError:
-            pass
-
-    # NOTE: We do NOT stop the gateway on backend shutdown!
-    # The gateway is managed by supervisor and should continue running
-    # independently of the backend. It will auto-restart on crash and
-    # survive backend restarts.
-    logger.info("Backend shutting down - gateway will continue running via supervisor")
-
-    client.close()

@@ -8,8 +8,8 @@ venv/
 
 # Environment files (contain secrets)
 .env
-*.env
-!.env.example
+backend/.env
+!backend/.env.example
 
 # Node
 node_modules/

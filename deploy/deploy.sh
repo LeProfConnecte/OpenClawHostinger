@@ -62,6 +62,10 @@ if [ "$(id -u)" -ne 0 ]; then
     error "This script must be run as root (sudo)"
 fi
 
+if [ "${DOMAIN}" = "yourdomain.com" ]; then
+    error "You must edit the DOMAIN variable in this script before running it."
+fi
+
 if [ ! -d "${SITE_ROOT}" ]; then
     error "Site root ${SITE_ROOT} does not exist. Create the site in CloudPanel first."
 fi
@@ -197,11 +201,17 @@ log "Configuring supervisor..."
 # Generate the supervisor config with correct paths
 SUPERVISOR_CONF="/etc/supervisor/conf.d/openclaw.conf"
 
+# Create a dedicated service user if it doesn't exist (security: don't run backend as root)
+if ! id -u openclaw &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin -d "${SITE_ROOT}" openclaw
+    log "Created 'openclaw' service user"
+fi
+
 cat > "${SUPERVISOR_CONF}" << SUPERVISOREOF
 [program:openclaw-backend]
 command=${VENV_DIR}/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1 --log-level info
 directory=${BACKEND_DIR}
-user=root
+user=openclaw
 autostart=true
 autorestart=true
 startretries=5
@@ -239,8 +249,13 @@ log "Supervisor configured"
 # ======================== PERMISSIONS ========================
 log "Setting file permissions..."
 
+# Set ownership for the openclaw service user
+chown -R openclaw:openclaw "${BACKEND_DIR}"
+chown -R openclaw:openclaw "${VENV_DIR}"
+
 # Secure the backend .env file
 if [ -f "${BACKEND_DIR}/.env" ]; then
+    chown openclaw:openclaw "${BACKEND_DIR}/.env"
     chmod 600 "${BACKEND_DIR}/.env"
 fi
 
