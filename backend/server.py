@@ -42,9 +42,9 @@ api_router = APIRouter(prefix="/api")
 # Moltbot Gateway Management
 MOLTBOT_PORT = 18789
 MOLTBOT_CONTROL_PORT = 18791
-CONFIG_DIR = os.path.expanduser("~/.clawdbot")
+CONFIG_DIR = os.environ.get("CLAWDBOT_HOME") or os.path.expanduser("~/.clawdbot")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "clawdbot.json")
-WORKSPACE_DIR = os.path.expanduser("~/clawd")
+WORKSPACE_DIR = os.environ.get("OPENCLAW_WORKSPACE") or os.path.expanduser("~/clawd")
 
 # Global state for gateway (per-user)
 # Note: Process is managed by supervisor, we only track metadata here
@@ -355,9 +355,10 @@ async def logout(request: Request, response: Response):
 # ============== Moltbot Helpers ==============
 
 # Persistent paths for Node.js and clawdbot
-NODE_DIR = "/root/nodejs"
-CLAWDBOT_DIR = "/root/.clawdbot-bin"
-CLAWDBOT_WRAPPER = "/root/run_clawdbot.sh"
+_home = os.environ.get("HOME", "/root")
+NODE_DIR = os.environ.get("NODE_DIR") or os.path.join(_home, "nodejs")
+CLAWDBOT_DIR = os.environ.get("CLAWDBOT_BIN_DIR") or os.path.join(_home, ".clawdbot-bin")
+CLAWDBOT_WRAPPER = os.environ.get("CLAWDBOT_WRAPPER") or os.path.join(_home, "run_clawdbot.sh")
 
 def get_clawdbot_command():
     """Get the path to clawdbot executable"""
@@ -977,7 +978,7 @@ async def proxy_moltbot_ui(request: Request, path: str = ""):
             )
 
             # Filter response headers
-            exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+            exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection", "www-authenticate"}
             response_headers = {
                 k: v for k, v in response.headers.items()
                 if k.lower() not in exclude_headers
@@ -1207,7 +1208,7 @@ async def whatsapp_auto_fix_watcher():
                 logger.info("[whatsapp-watcher] DETECTED registered=false, applying fix...")
                 if fix_registered_flag():
                     logger.info("[whatsapp-watcher] Fix applied, restarting gateway via supervisor...")
-                    result = subprocess.run(["supervisorctl", "restart", "clawdbot-gateway"], capture_output=True, text=True)
+                    result = subprocess.run(["supervisorctl", "restart", SupervisorClient.PROGRAM], capture_output=True, text=True)
                     logger.info(f"[whatsapp-watcher] Supervisor restart result: {result.stdout} {result.stderr}")
         except Exception as e:
             logger.warning(f"[whatsapp-watcher] Error: {e}")
