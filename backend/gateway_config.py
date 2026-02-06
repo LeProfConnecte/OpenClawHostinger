@@ -65,16 +65,17 @@ def write_gateway_env(token: str, api_key: str = None, provider: str = "emergent
         f'export CLAWDBOT_GATEWAY_TOKEN="{safe_token}"',
     ]
 
-    # Add provider-specific API keys
+    # Add provider-specific API keys + generic PROVIDER_API_KEY for JSON config references
     if api_key:
         safe_key = sanitize_shell_value(api_key)
+        # Generic key referenced as ${PROVIDER_API_KEY} in clawdbot.json
+        lines.append(f'export PROVIDER_API_KEY="{safe_key}"')
         if provider == "anthropic":
             lines.append(f'export ANTHROPIC_API_KEY="{safe_key}"')
         elif provider == "openai":
             lines.append(f'export OPENAI_API_KEY="{safe_key}"')
         elif provider == "openrouter":
             lines.append(f'export OPENROUTER_API_KEY="{safe_key}"')
-        # For emergent provider, the API key is in the config file, not env var
 
     # Write the file
     content = "\n".join(lines) + "\n"

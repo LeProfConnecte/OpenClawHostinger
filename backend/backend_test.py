@@ -1,10 +1,11 @@
+import os
 import requests
 import sys
 from datetime import datetime
 
 class MoltbotAPITester:
-    def __init__(self, base_url="https://brave-torvalds.preview.emergent.test/api"):
-        self.base_url = base_url
+    def __init__(self, base_url=None):
+        self.base_url = base_url or os.environ.get('TEST_BASE_URL', 'http://127.0.0.1:8000/api')
         self.tests_run = 0
         self.tests_passed = 0
         self.tests_failed = 0
@@ -85,7 +86,7 @@ class MoltbotAPITester:
         success, response = self.run_test(
             "Moltbot Status (Initial)",
             "GET",
-            "moltbot/status",
+            "openclaw/status",
             200
         )
         if success:
@@ -110,7 +111,7 @@ class MoltbotAPITester:
         success1, _ = self.run_test(
             "Start without provider",
             "POST",
-            "moltbot/start",
+            "openclaw/start",
             422,  # Validation error
             data={"apiKey": "test-key-1234567890"},
             headers=headers
@@ -120,7 +121,7 @@ class MoltbotAPITester:
         success2, _ = self.run_test(
             "Start with invalid provider",
             "POST",
-            "moltbot/start",
+            "openclaw/start",
             400,
             data={"provider": "invalid", "apiKey": "test-key-1234567890"},
             headers=headers
@@ -130,7 +131,7 @@ class MoltbotAPITester:
         success3, _ = self.run_test(
             "Start with short API key",
             "POST",
-            "moltbot/start",
+            "openclaw/start",
             400,
             data={"provider": "anthropic", "apiKey": "short"},
             headers=headers
@@ -173,28 +174,28 @@ class MoltbotAPITester:
             401
         )
         
-        # Test POST /moltbot/start without token
+        # Test POST /openclaw/start without token
         success2, _ = self.run_test(
-            "POST /moltbot/start (unauthenticated)",
+            "POST /openclaw/start (unauthenticated)",
             "POST",
-            "moltbot/start",
+            "openclaw/start",
             401,
             data={"provider": "anthropic", "apiKey": "sk-ant-test-1234567890"}
         )
         
-        # Test POST /moltbot/stop without token
+        # Test POST /openclaw/stop without token
         success3, _ = self.run_test(
-            "POST /moltbot/stop (unauthenticated)",
+            "POST /openclaw/stop (unauthenticated)",
             "POST",
-            "moltbot/stop",
+            "openclaw/stop",
             401
         )
         
-        # Test GET /moltbot/token without token
+        # Test GET /openclaw/token without token
         success4, _ = self.run_test(
-            "GET /moltbot/token (unauthenticated)",
+            "GET /openclaw/token (unauthenticated)",
             "GET",
-            "moltbot/token",
+            "openclaw/token",
             401
         )
         
@@ -237,9 +238,9 @@ class MoltbotAPITester:
         }
         
         success, response = self.run_test(
-            "GET /moltbot/status (authenticated)",
+            "GET /openclaw/status (authenticated)",
             "GET",
-            "moltbot/status",
+            "openclaw/status",
             200,
             headers=headers
         )
@@ -293,7 +294,7 @@ class MoltbotAPITester:
         success1, response1 = self.run_test(
             "Owner checks status",
             "GET",
-            "moltbot/status",
+            "openclaw/status",
             200,
             headers=owner_headers
         )
@@ -301,7 +302,7 @@ class MoltbotAPITester:
         success2, response2 = self.run_test(
             "Other user checks status",
             "GET",
-            "moltbot/status",
+            "openclaw/status",
             200,
             headers=other_headers
         )
@@ -341,7 +342,6 @@ def main():
     tester = MoltbotAPITester()
     
     # Get test tokens from environment or use hardcoded test tokens
-    import os
     owner_token = os.environ.get('TEST_OWNER_TOKEN', 'test_session_owner_1769688072511')
     other_token = os.environ.get('TEST_OTHER_TOKEN', 'test_session_other_1769688072511')
     

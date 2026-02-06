@@ -196,7 +196,7 @@ cat > "${SUPERVISOR_CONF}" <<EOF
 [program:openclaw-backend]
 command=${VENV_DIR}/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1 --log-level info
 directory=${BACKEND_DIR}
-user=openclaw
+user=${SITE_USER:-openclaw}
 autostart=true
 autorestart=true
 startretries=5
@@ -210,7 +210,7 @@ stdout_logfile_backups=3
 [program:clawdbot-gateway]
 command=/root/run_clawdbot.sh gateway --config /root/.clawdbot/clawdbot.json
 directory=/root
-environment=NODE_DIR="/root/nodejs",CLAWDBOT_DIR="/root/.clawdbot-bin",PATH="/root/nodejs/bin:/root/.clawdbot-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+environment=NODE_DIR="/root/nodejs",CLAWDBOT_DIR="/root/.clawdbot-bin",CLAWDBOT_HOME="/root/.clawdbot",PATH="/root/nodejs/bin:/root/.clawdbot-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 user=root
 autostart=false
 autorestart=unexpected

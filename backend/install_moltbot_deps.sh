@@ -125,6 +125,13 @@ export NODE_DIR=/root/nodejs
 export CLAWDBOT_DIR=/root/.clawdbot-bin
 export PATH="$NODE_DIR/bin:$CLAWDBOT_DIR:$PATH"
 
+# Source gateway environment (API keys, tokens) if available
+GATEWAY_ENV="${CLAWDBOT_HOME:-$HOME/.clawdbot}/gateway.env"
+if [ -f "$GATEWAY_ENV" ]; then
+    # shellcheck disable=SC1090
+    source "$GATEWAY_ENV"
+fi
+
 # Find clawdbot
 if [ -f "$CLAWDBOT_DIR/clawdbot" ]; then
     exec "$CLAWDBOT_DIR/clawdbot" "$@"
