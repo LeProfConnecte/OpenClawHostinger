@@ -6,16 +6,34 @@ checking the status of the gateway process managed by supervisord.
 """
 
 import os
+import re
 import subprocess
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Validate program name to prevent command injection via env var
+_SAFE_PROGRAM_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+
+def _validate_program_name(name: str) -> str:
+    """Validate that a supervisor program name is safe."""
+    if not name or not _SAFE_PROGRAM_RE.match(name):
+        raise ValueError(
+            f"Invalid supervisor program name: {name!r}. "
+            "Only alphanumeric, dashes, and underscores are allowed."
+        )
+    if len(name) > 64:
+        raise ValueError(f"Program name too long (max 64 chars): {name!r}")
+    return name
+
 
 class SupervisorClient:
     """Client for interacting with supervisord to manage the gateway process."""
 
-    PROGRAM = os.environ.get("SUPERVISOR_GATEWAY_PROGRAM", "clawdbot-gateway")
+    PROGRAM = _validate_program_name(
+        os.environ.get("SUPERVISOR_GATEWAY_PROGRAM", "clawdbot-gateway")
+    )
 
     @classmethod
     def start(cls) -> bool:
@@ -33,16 +51,16 @@ class SupervisorClient:
                 timeout=30
             )
             if result.returncode == 0:
-                logger.info(f"Started {cls.PROGRAM} via supervisor")
+                logger.info("Started %s via supervisor", cls.PROGRAM)
                 return True
             else:
-                logger.error(f"Failed to start {cls.PROGRAM}: {result.stderr}")
+                logger.error("Failed to start %s: %s", cls.PROGRAM, result.stderr)
                 return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Timeout starting {cls.PROGRAM}")
+            logger.error("Timeout starting %s", cls.PROGRAM)
             return False
         except Exception as e:
-            logger.error(f"Error starting {cls.PROGRAM}: {e}")
+            logger.error("Error starting %s: %s", cls.PROGRAM, e)
             return False
 
     @classmethod
@@ -61,16 +79,16 @@ class SupervisorClient:
                 timeout=30
             )
             if result.returncode == 0 or 'NOT RUNNING' in result.stdout:
-                logger.info(f"Stopped {cls.PROGRAM} via supervisor")
+                logger.info("Stopped %s via supervisor", cls.PROGRAM)
                 return True
             else:
-                logger.error(f"Failed to stop {cls.PROGRAM}: {result.stderr}")
+                logger.error("Failed to stop %s: %s", cls.PROGRAM, result.stderr)
                 return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Timeout stopping {cls.PROGRAM}")
+            logger.error("Timeout stopping %s", cls.PROGRAM)
             return False
         except Exception as e:
-            logger.error(f"Error stopping {cls.PROGRAM}: {e}")
+            logger.error("Error stopping %s: %s", cls.PROGRAM, e)
             return False
 
     @classmethod
@@ -92,7 +110,7 @@ class SupervisorClient:
             # Output format: "clawdbot-gateway            RUNNING   pid 12345, uptime 0:01:23"
             return 'RUNNING' in result.stdout
         except Exception as e:
-            logger.error(f"Error checking {cls.PROGRAM} status: {e}")
+            logger.error("Error checking %s status: %s", cls.PROGRAM, e)
             return False
 
     @classmethod
@@ -119,7 +137,7 @@ class SupervisorClient:
                     return int(pid_part)
             return None
         except Exception as e:
-            logger.error(f"Error getting {cls.PROGRAM} PID: {e}")
+            logger.error("Error getting %s PID: %s", cls.PROGRAM, e)
             return None
 
     @classmethod
@@ -138,16 +156,16 @@ class SupervisorClient:
                 timeout=30
             )
             if result.returncode == 0:
-                logger.info(f"Restarted {cls.PROGRAM} via supervisor")
+                logger.info("Restarted %s via supervisor", cls.PROGRAM)
                 return True
             else:
-                logger.error(f"Failed to restart {cls.PROGRAM}: {result.stderr}")
+                logger.error("Failed to restart %s: %s", cls.PROGRAM, result.stderr)
                 return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Timeout restarting {cls.PROGRAM}")
+            logger.error("Timeout restarting %s", cls.PROGRAM)
             return False
         except Exception as e:
-            logger.error(f"Error restarting {cls.PROGRAM}: {e}")
+            logger.error("Error restarting %s: %s", cls.PROGRAM, e)
             return False
 
     @classmethod
@@ -168,7 +186,7 @@ class SupervisorClient:
                 timeout=10
             )
             if result.returncode != 0:
-                logger.error(f"Failed to reread supervisor config: {result.stderr}")
+                logger.error("Failed to reread supervisor config: %s", result.stderr)
                 return False
 
             result = subprocess.run(
@@ -178,11 +196,11 @@ class SupervisorClient:
                 timeout=10
             )
             if result.returncode != 0:
-                logger.error(f"Failed to update supervisor: {result.stderr}")
+                logger.error("Failed to update supervisor: %s", result.stderr)
                 return False
 
             logger.info("Supervisor configuration reloaded")
             return True
         except Exception as e:
-            logger.error(f"Error reloading supervisor config: {e}")
+            logger.error("Error reloading supervisor config: %s", e)
             return False

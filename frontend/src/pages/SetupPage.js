@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Button } from '@/components/ui/button';
@@ -30,16 +30,28 @@ export default function SetupPage() {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState(null);
   const [checkingStatus, setCheckingStatus] = useState(true);
+  const progressIntervalRef = useRef(null);
+
+  // Clean up interval on unmount (L5)
+  useEffect(() => {
+    return () => {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+      }
+    };
+  }, []);
 
   // Check auth on mount (if not passed from AuthCallback)
   useEffect(() => {
     if (location.state?.user) {
       setIsAuthenticated(true);
       setUser(location.state.user);
+      // Clear location.state after consuming it (L7)
+      navigate(location.pathname, { replace: true, state: null });
       checkOpenClawStatus();
       return;
     }
-    
+
     const checkAuth = async () => {
       try {
         const response = await fetch(`${API}/auth/me`, {
@@ -97,7 +109,9 @@ export default function SetupPage() {
         const data = await res.json();
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const gatewayWsUrl = `${wsProtocol}//${window.location.host}/api/openclaw/ws`;
-        window.location.href = `${API}/openclaw/ui/?gatewayUrl=${encodeURIComponent(gatewayWsUrl)}&token=${encodeURIComponent(data.token)}`;
+        // H6: Pass token in URL fragment (#) instead of query string (?) to prevent
+        // token leaking in server logs, browser history, and Referer headers
+        window.location.href = `${API}/openclaw/ui/#gatewayUrl=${encodeURIComponent(gatewayWsUrl)}&token=${encodeURIComponent(data.token)}`;
       } else {
         toast.error('Unable to get access token');
       }
@@ -154,8 +168,8 @@ export default function SetupPage() {
       setLoading(true);
       setProgress(15);
 
-      // Simulate progress while waiting
-      const progressInterval = setInterval(() => {
+      // Simulate progress while waiting (L5: store ref for cleanup)
+      progressIntervalRef.current = setInterval(() => {
         setProgress(prev => {
           if (prev < 80) return prev + Math.random() * 10;
           return prev;
@@ -177,7 +191,8 @@ export default function SetupPage() {
         body: JSON.stringify(payload)
       });
 
-      clearInterval(progressInterval);
+      clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({ detail: 'Startup failed' }));
@@ -187,13 +202,13 @@ export default function SetupPage() {
       const data = await res.json();
       setProgress(95);
       toast.success('OpenClaw started successfully!');
-      
-      // Build the Control UI URL with token for authentication
-      // The Control UI accepts token as a query parameter which it stores in localStorage
+
+      // H6: Pass token in URL fragment (#) instead of query string (?)
+      // to prevent token leaking in server logs, browser history, and Referer headers
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const gatewayWsUrl = `${wsProtocol}//${window.location.host}/api/openclaw/ws`;
-      const controlUrl = `${data.controlUrl}?gatewayUrl=${encodeURIComponent(gatewayWsUrl)}&token=${encodeURIComponent(data.token)}`;
-      
+      const controlUrl = `${data.controlUrl}#gatewayUrl=${encodeURIComponent(gatewayWsUrl)}&token=${encodeURIComponent(data.token)}`;
+
       // Small delay before redirect
       setTimeout(() => {
         setProgress(100);
@@ -201,6 +216,8 @@ export default function SetupPage() {
       }, 1000);
 
     } catch (e) {
+      clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
       console.error(e);
       setError(e.message || 'Unable to start OpenClaw');
       toast.error('Startup error: ' + (e.message || 'Unknown error'));
