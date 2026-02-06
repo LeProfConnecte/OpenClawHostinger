@@ -1,213 +1,198 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
-# OpenClaw Deployment Script for Hostinger VPS with CloudPanel
+# OpenClaw - Deployment Script (CloudPanel / Hostinger VPS)
+# Idempotent: safe to re-run
 # =============================================================================
-#
-# PREREQUISITES:
-#   - Hostinger VPS with CloudPanel installed
-#   - A domain pointing to your VPS IP
-#   - SSH root access
-#
-# USAGE:
-#   1. Upload the project to your VPS
-#   2. Edit the variables below to match your setup
-#   3. Run: sudo bash deploy/deploy.sh
-#
-# WHAT THIS SCRIPT DOES:
-#   - Installs system dependencies (Python, MongoDB, Node.js, supervisor)
-#   - Creates a Python virtual environment
-#   - Installs backend dependencies
-#   - Builds the React frontend
-#   - Configures supervisor for the backend and gateway
-#   - Creates the .env file from .env.example
-#
-# AFTER RUNNING THIS SCRIPT:
-#   1. Go to CloudPanel -> Sites -> your domain -> Vhost
-#   2. Paste the content of deploy/cloudpanel-vhost.conf
-#   3. Replace "yourdomain.com" with your actual domain
-#   4. Enable SSL via CloudPanel's Let's Encrypt integration
-#   5. Edit backend/.env with your actual MONGO_URL and other settings
-#   6. Run: sudo supervisorctl restart openclaw-backend
-# =============================================================================
-
-set -e
+set -euo pipefail
 
 # ======================== CONFIGURATION ========================
-# EDIT THESE VARIABLES before running the script
+# REQUIRED
+DOMAIN="myopenclaw.leprofconnecte.com"
 
-DOMAIN="yourdomain.com"
-# CloudPanel typically uses /home/clp/htdocs/<domain>/ as the site root
-SITE_ROOT="/home/clp/htdocs/${DOMAIN}"
-PROJECT_DIR="${SITE_ROOT}"
-VENV_DIR="${SITE_ROOT}/venv"
-BACKEND_DIR="${SITE_ROOT}/backend"
-FRONTEND_DIR="${SITE_ROOT}/frontend"
+# OPTIONAL (leave empty to auto-detect from /home/*/htdocs/<domain>)
+SITE_ROOT=""
+
+# Versions
 NODE_VERSION="22.22.0"
-PYTHON_VERSION="3"
+PYTHON_BIN="python3"
 
 # ======================== COLORS ========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
-
-log() { echo -e "${GREEN}[DEPLOY]${NC} $1"; }
+log()  { echo -e "${GREEN}[DEPLOY]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+die()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ======================== CHECKS ========================
+require_root() { [ "$(id -u)" -eq 0 ] || die "Run as root: sudo bash deploy/deploy.sh"; }
+
+# ======================== PATH RESOLUTION ========================
+autodetect_site_root() {
+  local d1="/home/clp/htdocs/${DOMAIN}"
+  if [ -d "$d1" ]; then
+    echo "$d1"
+    return 0
+  fi
+
+  local found
+  found="$(find /home -maxdepth 3 -type d -path "/home/*/htdocs/${DOMAIN}" -print 2>/dev/null | head -n 1 || true)"
+  if [ -n "${found}" ] && [ -d "${found}" ]; then
+    echo "${found}"
+    return 0
+  fi
+
+  return 1
+}
+
+# ======================== START ========================
+require_root
 log "Starting OpenClaw deployment..."
 
-if [ "$(id -u)" -ne 0 ]; then
-    error "This script must be run as root (sudo)"
+[ "${DOMAIN}" != "yourdomain.com" ] || die "Edit DOMAIN in deploy/deploy.sh before running."
+
+if [ -z "${SITE_ROOT}" ]; then
+  SITE_ROOT="$(autodetect_site_root)" || die "Cannot find site root. Ensure CloudPanel site exists for ${DOMAIN}."
 fi
 
-if [ "${DOMAIN}" = "yourdomain.com" ]; then
-    error "You must edit the DOMAIN variable in this script before running it."
+[ -d "${SITE_ROOT}" ] || die "Site root does not exist: ${SITE_ROOT}"
+
+PROJECT_DIR="${SITE_ROOT}"
+VENV_DIR="${SITE_ROOT}/venv"
+BACKEND_DIR="${SITE_ROOT}/backend"
+FRONTEND_DIR="${SITE_ROOT}/frontend"
+FRONTEND_BUILD_DIR="${FRONTEND_DIR}/build"
+
+[ -d "${BACKEND_DIR}" ] || die "Missing backend directory: ${BACKEND_DIR}"
+[ -d "${FRONTEND_DIR}" ] || die "Missing frontend directory: ${FRONTEND_DIR}"
+[ -f "${BACKEND_DIR}/requirements.txt" ] || die "Missing backend/requirements.txt"
+
+# For convenience: detect CloudPanel site user (owner of SITE_ROOT)
+SITE_USER="$(stat -c '%U' "${SITE_ROOT}" 2>/dev/null || echo "")"
+if [ -z "${SITE_USER}" ] || [ "${SITE_USER}" = "root" ]; then
+  warn "Could not detect a non-root SITE_USER from ${SITE_ROOT}. Continuing anyway."
 fi
 
-if [ ! -d "${SITE_ROOT}" ]; then
-    error "Site root ${SITE_ROOT} does not exist. Create the site in CloudPanel first."
-fi
-
-# ======================== SYSTEM DEPENDENCIES ========================
-log "Installing system dependencies..."
-
+# ======================== SYSTEM PACKAGES ========================
+log "Installing system dependencies (apt)..."
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 
+# Tools used by the script
+apt-get install -y -qq ca-certificates curl gnupg lsb-release
+
 # Python
-if ! command -v python3 &> /dev/null; then
-    apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-pip
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  apt-get install -y -qq python3 python3-venv python3-pip
 fi
-
-# pip and venv
-apt-get install -y python3-venv python3-pip -qq
-
-# MongoDB
-if ! command -v mongod &> /dev/null; then
-    log "Installing MongoDB..."
-    # Import MongoDB public GPG key
-    curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | \
-        gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg 2>/dev/null || true
-
-    # Detect OS version
-    OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
-
-    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${OS_CODENAME}/mongodb-org/7.0 multiverse" | \
-        tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-
-    apt-get update -qq
-    apt-get install -y mongodb-org || {
-        warn "MongoDB package install failed. Trying mongosh + mongod standalone..."
-        apt-get install -y mongodb || true
-    }
-
-    systemctl enable mongod 2>/dev/null || true
-    systemctl start mongod 2>/dev/null || true
-    log "MongoDB installed and started"
-else
-    log "MongoDB already installed"
-    systemctl enable mongod 2>/dev/null || true
-    systemctl start mongod 2>/dev/null || true
-fi
+apt-get install -y -qq python3-venv python3-pip
 
 # Supervisor
-if ! command -v supervisord &> /dev/null; then
-    apt-get install -y supervisor
-    systemctl enable supervisor
-    systemctl start supervisor
+if ! command -v supervisord >/dev/null 2>&1; then
+  apt-get install -y -qq supervisor
+  systemctl enable supervisor >/dev/null 2>&1 || true
+  systemctl start supervisor  >/dev/null 2>&1 || true
 fi
 
-# Node.js (for building frontend and running clawdbot)
+# MongoDB (best effort)
+if ! command -v mongod >/dev/null 2>&1; then
+  log "Installing MongoDB (best effort)..."
+  curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc \
+    | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg 2>/dev/null || true
+
+  OS_CODENAME="$(lsb_release -cs 2>/dev/null || echo "jammy")"
+  echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${OS_CODENAME}/mongodb-org/7.0 multiverse" \
+    > /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+  apt-get update -qq
+  if ! apt-get install -y -qq mongodb-org; then
+    warn "mongodb-org install failed, trying 'mongodb' package..."
+    apt-get install -y -qq mongodb || true
+  fi
+fi
+systemctl enable mongod >/dev/null 2>&1 || true
+systemctl start mongod  >/dev/null 2>&1 || true
+
+# ======================== NODE.JS (for frontend build + clawdbot deps) ========================
 NODE_DIR="/root/nodejs"
-if [ ! -f "${NODE_DIR}/bin/node" ]; then
-    log "Installing Node.js v${NODE_VERSION}..."
-    mkdir -p "${NODE_DIR}"
+if [ ! -x "${NODE_DIR}/bin/node" ]; then
+  log "Installing Node.js v${NODE_VERSION} into ${NODE_DIR}..."
+  mkdir -p "${NODE_DIR}"
 
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "x86_64" ]; then
-        NODE_ARCH="x64"
-    elif [ "$ARCH" = "aarch64" ]; then
-        NODE_ARCH="arm64"
-    else
-        NODE_ARCH="x64"
-    fi
+  ARCH="$(uname -m)"
+  case "${ARCH}" in
+    x86_64) NODE_ARCH="x64" ;;
+    aarch64) NODE_ARCH="arm64" ;;
+    *) NODE_ARCH="x64" ;;
+  esac
 
-    cd /tmp
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" -o "node.tar.xz"
-    tar -xJf "node.tar.xz"
-    cp -r "node-v${NODE_VERSION}-linux-${NODE_ARCH}"/* "${NODE_DIR}/"
-    rm -rf "node.tar.xz" "node-v${NODE_VERSION}-linux-${NODE_ARCH}"
-    log "Node.js v${NODE_VERSION} installed"
+  cd /tmp
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" -o node.tar.xz
+  tar -xJf node.tar.xz
+  cp -r "node-v${NODE_VERSION}-linux-${NODE_ARCH}/"* "${NODE_DIR}/"
+  rm -rf node.tar.xz "node-v${NODE_VERSION}-linux-${NODE_ARCH}"
 else
-    log "Node.js already installed at ${NODE_DIR}"
+  log "Node.js already installed at ${NODE_DIR}"
 fi
 
-export PATH="${NODE_DIR}/bin:$PATH"
+export PATH="${NODE_DIR}/bin:${PATH}"
 
-# Yarn (used by the frontend)
-if ! command -v yarn &> /dev/null; then
-    npm install -g yarn
+if ! command -v yarn >/dev/null 2>&1; then
+  log "Installing Yarn..."
+  npm install -g yarn >/dev/null 2>&1 || npm install -g yarn
 fi
 
-# ======================== PYTHON VIRTUAL ENVIRONMENT ========================
+# ======================== PYTHON VENV + BACKEND DEPS ========================
 log "Setting up Python virtual environment..."
-
 if [ ! -d "${VENV_DIR}" ]; then
-    python3 -m venv "${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi
 
+# shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip -q
 pip install -r "${BACKEND_DIR}/requirements.txt" -q
-log "Python dependencies installed"
 
 # ======================== BACKEND .ENV ========================
 if [ ! -f "${BACKEND_DIR}/.env" ]; then
-    if [ -f "${BACKEND_DIR}/.env.example" ]; then
-        cp "${BACKEND_DIR}/.env.example" "${BACKEND_DIR}/.env"
-        # Substitute domain
-        sed -i "s/yourdomain.com/${DOMAIN}/g" "${BACKEND_DIR}/.env"
-        warn "Created ${BACKEND_DIR}/.env from .env.example - EDIT IT with your actual values!"
-    else
-        warn "No .env.example found. Create ${BACKEND_DIR}/.env manually."
-    fi
+  if [ -f "${BACKEND_DIR}/.env.example" ]; then
+    cp "${BACKEND_DIR}/.env.example" "${BACKEND_DIR}/.env"
+    sed -i "s/yourdomain.com/${DOMAIN}/g" "${BACKEND_DIR}/.env" || true
+    warn "Created ${BACKEND_DIR}/.env from .env.example - you must edit EMERGENT_API_KEY + CORS_ORIGINS."
+  else
+    warn "No .env.example found. Create ${BACKEND_DIR}/.env manually."
+  fi
 else
-    log ".env file already exists"
+  log "backend/.env already exists (kept as-is)"
 fi
 
 # ======================== FRONTEND BUILD ========================
 log "Building React frontend..."
-
 cd "${FRONTEND_DIR}"
-
-# Set the backend URL for the build (same origin, no prefix needed)
 export REACT_APP_BACKEND_URL=""
-
 yarn install --frozen-lockfile 2>/dev/null || yarn install
 yarn build
 
-log "Frontend built successfully"
-
-# ======================== CLAWDBOT INSTALLATION ========================
-log "Installing clawdbot..."
-
-cd "${BACKEND_DIR}"
-bash install_moltbot_deps.sh || warn "Clawdbot installation had issues - check logs"
-
-# ======================== SUPERVISOR CONFIGURATION ========================
-log "Configuring supervisor..."
-
-# Generate the supervisor config with correct paths
-SUPERVISOR_CONF="/etc/supervisor/conf.d/openclaw.conf"
-
-# Create a dedicated service user if it doesn't exist (security: don't run backend as root)
-if ! id -u openclaw &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin -d "${SITE_ROOT}" openclaw
-    log "Created 'openclaw' service user"
+if [ ! -f "${FRONTEND_BUILD_DIR}/index.html" ]; then
+  die "Frontend build failed: ${FRONTEND_BUILD_DIR}/index.html not found"
 fi
 
-cat > "${SUPERVISOR_CONF}" << SUPERVISOREOF
+# ======================== CLAWDBOT / MOLT deps ========================
+log "Installing clawdbot dependencies (best effort)..."
+cd "${BACKEND_DIR}"
+bash install_moltbot_deps.sh || warn "Clawdbot deps had issues - check /tmp/moltbot_deps.log"
+
+# ======================== SUPERVISOR CONFIG ========================
+log "Configuring Supervisor..."
+SUPERVISOR_CONF="/etc/supervisor/conf.d/openclaw.conf"
+
+# Dedicated service user for backend
+if ! id -u openclaw >/dev/null 2>&1; then
+  useradd -r -s /usr/sbin/nologin -d "${SITE_ROOT}" openclaw
+  log "Created service user: openclaw"
+fi
+
+cat > "${SUPERVISOR_CONF}" <<EOF
 [program:openclaw-backend]
 command=${VENV_DIR}/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1 --log-level info
 directory=${BACKEND_DIR}
@@ -236,67 +221,42 @@ redirect_stderr=true
 stdout_logfile=/var/log/supervisor/clawdbot-gateway.log
 stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=3
-SUPERVISOREOF
+EOF
 
-# Create log directory
 mkdir -p /var/log/supervisor
-
-supervisorctl reread
-supervisorctl update
-
-log "Supervisor configured"
+supervisorctl reread >/dev/null
+supervisorctl update  >/dev/null
 
 # ======================== PERMISSIONS ========================
 log "Setting file permissions..."
+chown -R openclaw:openclaw "${BACKEND_DIR}" "${VENV_DIR}"
 
-# Set ownership for the openclaw service user
-chown -R openclaw:openclaw "${BACKEND_DIR}"
-chown -R openclaw:openclaw "${VENV_DIR}"
-
-# Secure the backend .env file
-if [ -f "${BACKEND_DIR}/.env" ]; then
-    chown openclaw:openclaw "${BACKEND_DIR}/.env"
-    chmod 600 "${BACKEND_DIR}/.env"
+# Keep frontend editable by CloudPanel site user if possible
+if [ -n "${SITE_USER}" ] && id -u "${SITE_USER}" >/dev/null 2>&1; then
+  chown -R "${SITE_USER}:${SITE_USER}" "${FRONTEND_DIR}" || true
 fi
 
-# Secure clawdbot config directory
+if [ -f "${BACKEND_DIR}/.env" ]; then
+  chown openclaw:openclaw "${BACKEND_DIR}/.env"
+  chmod 600 "${BACKEND_DIR}/.env"
+fi
+
 mkdir -p /root/.clawdbot
 chmod 700 /root/.clawdbot
 
 # ======================== START BACKEND ========================
-log "Starting OpenClaw backend..."
-supervisorctl start openclaw-backend 2>/dev/null || supervisorctl restart openclaw-backend
+log "Starting backend..."
+supervisorctl restart openclaw-backend >/dev/null 2>&1 || supervisorctl start openclaw-backend
 
-# ======================== DONE ========================
 echo ""
 echo "============================================="
-echo -e "${GREEN}  OpenClaw Deployment Complete!${NC}"
+echo " OpenClaw Deployment Complete"
 echo "============================================="
 echo ""
-echo "NEXT STEPS:"
-echo ""
-echo "  1. CONFIGURE CloudPanel Vhost:"
-echo "     - Go to CloudPanel -> Sites -> ${DOMAIN} -> Vhost"
-echo "     - Paste the content of deploy/cloudpanel-vhost.conf"
-echo "     - Replace 'yourdomain.com' with '${DOMAIN}'"
-echo "     - Save and restart Nginx"
-echo ""
-echo "  2. ENABLE SSL:"
-echo "     - Go to CloudPanel -> Sites -> ${DOMAIN} -> SSL/TLS"
-echo "     - Click 'Create Let's Encrypt Certificate'"
-echo ""
-echo "  3. EDIT backend/.env:"
-echo "     - Set MONGO_URL, CORS_ORIGINS, EMERGENT_API_KEY"
-echo "     - File: ${BACKEND_DIR}/.env"
-echo ""
-echo "  4. RESTART backend after .env changes:"
-echo "     sudo supervisorctl restart openclaw-backend"
-echo ""
-echo "  5. CHECK STATUS:"
-echo "     sudo supervisorctl status"
-echo "     curl -s http://127.0.0.1:8000/api/ | python3 -m json.tool"
-echo ""
-echo "  LOGS:"
-echo "     tail -f /var/log/supervisor/openclaw-backend.log"
-echo "     tail -f /var/log/supervisor/clawdbot-gateway.log"
+echo "Next steps:"
+echo "1) CloudPanel > Sites > ${DOMAIN} > Vhost: paste the corrected vhost (below)."
+echo "2) CloudPanel > SSL/TLS: issue Let's Encrypt."
+echo "3) Edit: ${BACKEND_DIR}/.env (CORS_ORIGINS + EMERGENT_API_KEY)."
+echo "4) Restart: sudo supervisorctl restart openclaw-backend"
+echo "5) Local check: curl -s http://127.0.0.1:8000/api/"
 echo ""
