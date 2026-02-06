@@ -18,6 +18,9 @@ node_modules/
 frontend/build/
 dist/
 
+# Generated deployment files (contain site-specific paths)
+deploy/generated-vhost.conf
+
 # IDE
 .vscode/
 .idea/

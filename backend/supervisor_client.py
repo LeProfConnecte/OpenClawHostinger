@@ -3,6 +3,10 @@ Supervisor client for managing the clawdbot gateway process.
 
 This module provides a clean interface for starting, stopping, and
 checking the status of the gateway process managed by supervisord.
+
+When the backend runs as a non-root user (e.g. CloudPanel site user),
+commands are prefixed with `sudo`. The deploy script configures sudoers
+to allow passwordless supervisorctl for the site user.
 """
 
 import os
@@ -28,6 +32,19 @@ def _validate_program_name(name: str) -> str:
     return name
 
 
+def _build_cmd(args: list[str]) -> list[str]:
+    """
+    Build the supervisorctl command, prefixing with sudo if not root.
+
+    On CloudPanel, the backend runs as the site user (e.g. myopenclaw).
+    The deploy script creates /etc/sudoers.d/openclaw to allow passwordless
+    supervisorctl for the site user.
+    """
+    if os.geteuid() == 0:
+        return args
+    return ['sudo', '-n'] + args
+
+
 class SupervisorClient:
     """Client for interacting with supervisord to manage the gateway process."""
 
@@ -45,7 +62,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'start', cls.PROGRAM],
+                _build_cmd(['supervisorctl', 'start', cls.PROGRAM]),
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -73,7 +90,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'stop', cls.PROGRAM],
+                _build_cmd(['supervisorctl', 'stop', cls.PROGRAM]),
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -101,7 +118,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'status', cls.PROGRAM],
+                _build_cmd(['supervisorctl', 'status', cls.PROGRAM]),
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -123,7 +140,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'status', cls.PROGRAM],
+                _build_cmd(['supervisorctl', 'status', cls.PROGRAM]),
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -150,7 +167,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'restart', cls.PROGRAM],
+                _build_cmd(['supervisorctl', 'restart', cls.PROGRAM]),
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -180,7 +197,7 @@ class SupervisorClient:
         """
         try:
             result = subprocess.run(
-                ['supervisorctl', 'reread'],
+                _build_cmd(['supervisorctl', 'reread']),
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -190,7 +207,7 @@ class SupervisorClient:
                 return False
 
             result = subprocess.run(
-                ['supervisorctl', 'update'],
+                _build_cmd(['supervisorctl', 'update']),
                 capture_output=True,
                 text=True,
                 timeout=10

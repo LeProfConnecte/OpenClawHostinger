@@ -38,7 +38,7 @@ load_dotenv(ROOT_DIR / '.env')
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 mongo_client = AsyncIOMotorClient(mongo_url)
-db = mongo_client[os.environ.get('DB_NAME', 'moltbot_app')]
+db = mongo_client[os.environ.get('DB_NAME', 'openclaw_app')]
 
 # Shared httpx client (H5: reuse across requests instead of creating per-request)
 _http_client: Optional[httpx.AsyncClient] = None
